@@ -1,4 +1,4 @@
-name: Build pdf2htmlEX native Windows x86 and x64 (v6)
+name: Build pdf2htmlEX native Windows x86 and x64 (v7)
 
 on:
   workflow_dispatch:
@@ -86,6 +86,9 @@ jobs:
           export UNATTENDED="1"
           export PDF2HTMLEX_BRANCH="${GITHUB_REF_NAME:-master}"
           export PKG_CONFIG_PATH="$MINGW_PREFIX/lib/pkgconfig:$MINGW_PREFIX/share/pkgconfig:${PKG_CONFIG_PATH:-}"
+          # Work around a MinGW gettext header alias that otherwise emits undefined __printf__ references.
+          export CFLAGS="${CFLAGS:-} -D__printf__=printf"
+          export CXXFLAGS="${CXXFLAGS:-} -D__printf__=printf"
           EOF
 
           source .win-tools/env.sh
@@ -250,7 +253,51 @@ jobs:
           source .win-tools/env.sh
           bash ./buildScripts/buildFontforge 2>&1 | tee logs/09-build-fontforge.log
 
-      - name: Build pdf2htmlEX.exe (CMake 4 compatibility)
+      - name: Patch Windows gettext and iconv link dependencies
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          {
+            test -f "$MINGW_PREFIX/lib/libintl.dll.a" || test -f "$MINGW_PREFIX/lib/libintl.a"
+            test -f "$MINGW_PREFIX/lib/libiconv.dll.a" || test -f "$MINGW_PREFIX/lib/libiconv.a"
+            python - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          cmake_file = Path("pdf2htmlEX/CMakeLists.txt")
+          if not cmake_file.is_file():
+              raise SystemExit(f"Missing CMake file: {cmake_file}")
+          text = cmake_file.read_text(encoding="utf-8")
+          pattern = re.compile(
+              r"(?is)if\s*\(\s*EXISTS\s+/usr/lib/libintl\.so\s*\)\s*"
+              r"set\s*\(\s*LIB_INTL_LIBRARIES\s+-lintl\s*\)\s*"
+              r"else\s*\(\s*\)\s*"
+              r"set\s*\(\s*LIB_INTL_LIBRARIES\s+\"\"\s*\)\s*"
+              r"endif\s*\(\s*\)")
+          replacement = '''if (MINGW)
+            set(LIB_INTL_LIBRARIES -lintl -liconv)
+          elseif (EXISTS /usr/lib/libintl.so )
+            set(LIB_INTL_LIBRARIES -lintl )
+          else()
+            set(LIB_INTL_LIBRARIES "" )
+          endif()'''
+          updated, count = pattern.subn(lambda _: replacement, text, count=1)
+          if count != 1:
+              print("Could not find the expected LIB_INTL_LIBRARIES block.")
+              for i, line in enumerate(text.splitlines(), 1):
+                  if "LIB_INTL_LIBRARIES" in line or "libintl.so" in line:
+                      print(f"{i}: {line}")
+              raise SystemExit("Refusing to build without explicitly linking gettext and iconv on MinGW.")
+          cmake_file.write_text(updated, encoding="utf-8")
+          check = cmake_file.read_text(encoding="utf-8")
+          if "if (MINGW)\n  set(LIB_INTL_LIBRARIES -lintl -liconv)" not in check:
+              raise SystemExit("Verification failed: MinGW gettext/iconv link patch was not persisted.")
+          print("Patched pdf2htmlEX to link libintl and libiconv on MinGW.")
+          PYCODE
+            grep -n -A8 -B2 'LIB_INTL_LIBRARIES' pdf2htmlEX/CMakeLists.txt
+          } 2>&1 | tee logs/10-gettext-iconv-link-patch.log
+
+      - name: Build pdf2htmlEX.exe (CMake 4 and MinGW gettext compatibility)
         shell: msys2 {0}
         run: |
           set -euo pipefail
@@ -258,6 +305,8 @@ jobs:
           {
             echo "CMake version:"
             cmake --version
+            echo "Compiler flags: CFLAGS=$CFLAGS"
+            echo "Compiler flags: CXXFLAGS=$CXXFLAGS"
             echo "Using CMAKE_POLICY_VERSION_MINIMUM=3.5 for the legacy pdf2htmlEX CMakeLists.txt"
             CMAKE_POLICY_VERSION_MINIMUM=3.5 bash ./buildScripts/buildPdf2htmlEX
           } 2>&1 | tee logs/10-build-pdf2htmlEX.log
