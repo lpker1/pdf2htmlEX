@@ -1,4 +1,4 @@
-name: Build pdf2htmlEX native Windows x86 and x64 (v5)
+name: Build pdf2htmlEX native Windows x86 and x64 (v6)
 
 on:
   workflow_dispatch:
@@ -250,12 +250,17 @@ jobs:
           source .win-tools/env.sh
           bash ./buildScripts/buildFontforge 2>&1 | tee logs/09-build-fontforge.log
 
-      - name: Build pdf2htmlEX.exe
+      - name: Build pdf2htmlEX.exe (CMake 4 compatibility)
         shell: msys2 {0}
         run: |
           set -euo pipefail
           source .win-tools/env.sh
-          bash ./buildScripts/buildPdf2htmlEX 2>&1 | tee logs/10-build-pdf2htmlEX.log
+          {
+            echo "CMake version:"
+            cmake --version
+            echo "Using CMAKE_POLICY_VERSION_MINIMUM=3.5 for the legacy pdf2htmlEX CMakeLists.txt"
+            CMAKE_POLICY_VERSION_MINIMUM=3.5 bash ./buildScripts/buildPdf2htmlEX
+          } 2>&1 | tee logs/10-build-pdf2htmlEX.log
 
       - name: Assemble portable directory and bundle runtime DLLs
         shell: msys2 {0}
