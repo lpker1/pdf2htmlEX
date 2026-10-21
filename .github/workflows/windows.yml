@@ -1,17 +1,24 @@
-name: Build pdf2htmlEX for native Windows (experimental)
+name: Build pdf2htmlEX native Windows x64
 
 on:
   workflow_dispatch:
   push:
+    paths:
+      - '.github/workflows/windows.yml'
+      - 'buildScripts/**'
+      - 'pdf2htmlEX/**'
+
+permissions:
+  contents: read
 
 jobs:
   build-windows-x64:
     runs-on: windows-2022
     steps:
-      - name: Check out latest source
-        uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@v5
 
-      - name: Install MSYS2 UCRT64 compiler and libraries
+      - name: Install MSYS2 UCRT64 toolchain and dependencies
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -20,11 +27,13 @@ jobs:
             base-devel
             git
             wget
+            tar
             patch
             python
             ruby
             mingw-w64-ucrt-x86_64-toolchain
             mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-make
             mingw-w64-ucrt-x86_64-pkgconf
             mingw-w64-ucrt-x86_64-cairo
             mingw-w64-ucrt-x86_64-glib2
@@ -41,49 +50,126 @@ jobs:
             mingw-w64-ucrt-x86_64-ntldd
             mingw-w64-ucrt-x86_64-gperf
 
-      - name: Build from source with MinGW
+      - name: Prepare MinGW make wrapper and build environment
         shell: msys2 {0}
         run: |
           set -euo pipefail
+          mkdir -p .win-tools logs
+
+          # The upstream scripts invoke `make`, while the MinGW Makefiles
+          # generator expects mingw32-make. Route the script calls correctly.
+          cat > .win-tools/make <<'EOF'
+          #!/usr/bin/env bash
+          exec mingw32-make "$@"
+          EOF
+          chmod +x .win-tools/make
+
+          # Use a native Windows path for CMake's install prefix.
+          cat > .win-tools/env.sh <<'EOF'
+          export PATH="$PWD/.win-tools:$PATH"
           export CMAKE_GENERATOR="MinGW Makefiles"
-          export PDF2HTMLEX_PREFIX="$PWD/_stage"
+          export PDF2HTMLEX_PREFIX="$(cygpath -m "$PWD/_stage")"
           export MAKE_PARALLEL="-j2"
           export UNATTENDED="1"
-          export PDF2HTMLEX_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          export PDF2HTMLEX_BRANCH="${GITHUB_REF_NAME:-master}"
+          EOF
 
-          # The project script pins compatible Poppler and FontForge source versions.
-          ./buildScripts/versionEnvs
-          ./buildScripts/getPoppler
-          ./buildScripts/buildPoppler
-          ./buildScripts/getFontforge
-          ./buildScripts/buildFontforge
-          ./buildScripts/buildPdf2htmlEX
+          source .win-tools/env.sh
+          echo "Generator: $CMAKE_GENERATOR"
+          echo "Prefix: $PDF2HTMLEX_PREFIX"
+          echo "Branch/ref: $PDF2HTMLEX_BRANCH"
+          command -v gcc
+          command -v g++
+          command -v cmake
+          command -v mingw32-make
+          command -v make
+          printf 'Compiler and paths verified.\n' | tee logs/01-environment.log
 
-      - name: Assemble a portable Windows folder
+      - name: Resolve pinned source versions
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          mkdir -p package/data/poppler
-          cp pdf2htmlEX/build/pdf2htmlEX.exe package/
-          cp -a pdf2htmlEX/share/. package/data/
-          cp -a poppler-data/. package/data/poppler/
+          source .win-tools/env.sh
+          bash ./buildScripts/versionEnvs 2>&1 | tee logs/02-version-envs.log
 
-          # Bundle UCRT64 runtime DLLs recursively, excluding Windows system DLLs.
-          ntldd -R package/pdf2htmlEX.exe > ntldd-report.txt
-          sed -nE 's/.*=>[[:space:]]*([^[:space:]]+\.dll).*/\1/ip' ntldd-report.txt | sort -fu |
+      - name: Download Poppler sources
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          source .win-tools/env.sh
+          bash ./buildScripts/getPoppler 2>&1 | tee logs/03-get-poppler.log
+
+      - name: Build Poppler
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          source .win-tools/env.sh
+          bash ./buildScripts/buildPoppler 2>&1 | tee logs/04-build-poppler.log
+
+      - name: Download FontForge sources
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          source .win-tools/env.sh
+          bash ./buildScripts/getFontforge 2>&1 | tee logs/05-get-fontforge.log
+
+      - name: Build FontForge
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          source .win-tools/env.sh
+          bash ./buildScripts/buildFontforge 2>&1 | tee logs/06-build-fontforge.log
+
+      - name: Build pdf2htmlEX.exe
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          source .win-tools/env.sh
+          bash ./buildScripts/buildPdf2htmlEX 2>&1 | tee logs/07-build-pdf2htmlEX.log
+
+      - name: Assemble portable directory and bundle runtime DLLs
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p package/poppler
+          cp pdf2htmlEX/build/pdf2htmlEX.exe package/
+
+          # On MinGW the program defaults to the executable directory for
+          # its resource data, and to <exe-dir>/poppler for Poppler CMaps.
+          cp -a pdf2htmlEX/share/. package/
+          cp -a poppler-data/. package/poppler/
+
+          ntldd -R package/pdf2htmlEX.exe 2>&1 | tee logs/08-dll-dependencies.log
+
+          # Collect all dependencies found by ntldd from the UCRT64 prefix.
+          # DLLs belonging to Windows itself are not present in this prefix.
+          grep -oiE '[[:alnum:]_.+-]+\.dll' logs/08-dll-dependencies.log | sort -fu |
           while IFS= read -r dll; do
-            dep="$(cygpath -u "$dll" 2>/dev/null || true)"
-            case "$dep" in
-              /ucrt64/bin/*.dll)
-                if [ -f "$dep" ]; then cp -n "$dep" package/; fi
-                ;;
-            esac
+            if [ -f "$MINGW_PREFIX/bin/$dll" ]; then
+              cp -n "$MINGW_PREFIX/bin/$dll" package/
+            fi
           done
 
-          # Basic smoke test: executable should start and report its version.
-          ./package/pdf2htmlEX.exe --version
+          test -f package/pdf2htmlEX.exe
+          test -d package/poppler
+          ls -la package | tee logs/09-package-list.log
 
-      - name: Upload Windows build
+      - name: Smoke test Windows executable
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          ./package/pdf2htmlEX.exe --version 2>&1 | tee logs/10-smoke-test.log
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf2htmlEX-windows-build-logs
+          path: logs/
+          if-no-files-found: warn
+
+      - name: Upload portable Windows build
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: pdf2htmlEX-windows-x64-portable
