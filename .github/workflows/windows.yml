@@ -99,33 +99,61 @@ jobs:
           source .win-tools/env.sh
           bash ./buildScripts/getPoppler 2>&1 | tee logs/03-get-poppler.log
 
+      - name: Patch Poppler GLib code-generator path for MSYS2
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          python - <<'PYCODE'
+          from pathlib import Path
+
+          cmake_file = Path("poppler/glib/CMakeLists.txt")
+          if not cmake_file.is_file():
+              raise SystemExit(f"Expected Poppler CMake file was not found: {cmake_file}")
+
+          text = cmake_file.read_text(encoding="utf-8")
+          old = "find_program(GLIB2_MKENUMS glib-mkenums REQUIRED)"
+          new = "find_program(GLIB2_MKENUMS glib-mkenums-script.py REQUIRED)"
+          if new in text:
+              print("Poppler GLib generator path is already patched.")
+          elif old in text:
+              cmake_file.write_text(text.replace(old, new, 1), encoding="utf-8")
+              print("Patched GLIB2_MKENUMS to use glib-mkenums-script.py.")
+          else:
+              matching = [line for line in text.splitlines() if "GLIB2_MKENUMS" in line or "glib-mkenums" in line]
+              print("Could not find the expected Poppler CMake line. Matching lines:")
+              print("\n".join(matching))
+              raise SystemExit("Poppler GLib generator patch did not apply; refusing to continue.")
+          PYCODE
+          test -f "$MINGW_PREFIX/bin/glib-mkenums-script.py"
+          grep -n 'GLIB2_MKENUMS' poppler/glib/CMakeLists.txt | tee logs/04-poppler-glib-generator-patch.log
+
       - name: Build Poppler
         shell: msys2 {0}
         run: |
           set -euo pipefail
           source .win-tools/env.sh
-          bash ./buildScripts/buildPoppler 2>&1 | tee logs/04-build-poppler.log
+          bash ./buildScripts/buildPoppler 2>&1 | tee logs/05-build-poppler.log
 
       - name: Download FontForge sources
         shell: msys2 {0}
         run: |
           set -euo pipefail
           source .win-tools/env.sh
-          bash ./buildScripts/getFontforge 2>&1 | tee logs/05-get-fontforge.log
+          bash ./buildScripts/getFontforge 2>&1 | tee logs/06-get-fontforge.log
 
       - name: Build FontForge
         shell: msys2 {0}
         run: |
           set -euo pipefail
           source .win-tools/env.sh
-          bash ./buildScripts/buildFontforge 2>&1 | tee logs/06-build-fontforge.log
+          bash ./buildScripts/buildFontforge 2>&1 | tee logs/07-build-fontforge.log
 
       - name: Build pdf2htmlEX.exe
         shell: msys2 {0}
         run: |
           set -euo pipefail
           source .win-tools/env.sh
-          bash ./buildScripts/buildPdf2htmlEX 2>&1 | tee logs/07-build-pdf2htmlEX.log
+          bash ./buildScripts/buildPdf2htmlEX 2>&1 | tee logs/08-build-pdf2htmlEX.log
 
       - name: Assemble portable directory and bundle runtime DLLs
         shell: msys2 {0}
@@ -139,11 +167,11 @@ jobs:
           cp -a pdf2htmlEX/share/. package/
           cp -a poppler-data/. package/poppler/
 
-          ntldd -R package/pdf2htmlEX.exe 2>&1 | tee logs/08-dll-dependencies.log
+          ntldd -R package/pdf2htmlEX.exe 2>&1 | tee logs/09-dll-dependencies.log
 
           # Collect all dependencies found by ntldd from the UCRT64 prefix.
           # DLLs belonging to Windows itself are not present in this prefix.
-          grep -oiE '[[:alnum:]_.+-]+\.dll' logs/08-dll-dependencies.log | sort -fu |
+          grep -oiE '[[:alnum:]_.+-]+\.dll' logs/09-dll-dependencies.log | sort -fu |
           while IFS= read -r dll; do
             if [ -f "$MINGW_PREFIX/bin/$dll" ]; then
               cp -n "$MINGW_PREFIX/bin/$dll" package/
@@ -152,13 +180,13 @@ jobs:
 
           test -f package/pdf2htmlEX.exe
           test -d package/poppler
-          ls -la package | tee logs/09-package-list.log
+          ls -la package | tee logs/10-package-list.log
 
       - name: Smoke test Windows executable
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          ./package/pdf2htmlEX.exe --version 2>&1 | tee logs/10-smoke-test.log
+          ./package/pdf2htmlEX.exe --version 2>&1 | tee logs/11-smoke-test.log
 
       - name: Upload diagnostic logs
         if: always()
