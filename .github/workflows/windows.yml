@@ -1,0 +1,91 @@
+name: Build pdf2htmlEX for native Windows (experimental)
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-2022
+    steps:
+      - name: Check out latest source
+        uses: actions/checkout@v4
+
+      - name: Install MSYS2 UCRT64 compiler and libraries
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            base-devel
+            git
+            wget
+            patch
+            python
+            ruby
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-cairo
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-freetype
+            mingw-w64-ucrt-x86_64-fontconfig
+            mingw-w64-ucrt-x86_64-libpng
+            mingw-w64-ucrt-x86_64-libjpeg-turbo
+            mingw-w64-ucrt-x86_64-libxml2
+            mingw-w64-ucrt-x86_64-openjpeg2
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-gettext
+            mingw-w64-ucrt-x86_64-libiconv
+            mingw-w64-ucrt-x86_64-lcms2
+            mingw-w64-ucrt-x86_64-ntldd
+            mingw-w64-ucrt-x86_64-gperf
+
+      - name: Build from source with MinGW
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export CMAKE_GENERATOR="MinGW Makefiles"
+          export PDF2HTMLEX_PREFIX="$PWD/_stage"
+          export MAKE_PARALLEL="-j2"
+          export UNATTENDED="1"
+          export PDF2HTMLEX_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+
+          # The project script pins compatible Poppler and FontForge source versions.
+          ./buildScripts/versionEnvs
+          ./buildScripts/getPoppler
+          ./buildScripts/buildPoppler
+          ./buildScripts/getFontforge
+          ./buildScripts/buildFontforge
+          ./buildScripts/buildPdf2htmlEX
+
+      - name: Assemble a portable Windows folder
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p package/data/poppler
+          cp pdf2htmlEX/build/pdf2htmlEX.exe package/
+          cp -a pdf2htmlEX/share/. package/data/
+          cp -a poppler-data/. package/data/poppler/
+
+          # Bundle UCRT64 runtime DLLs recursively, excluding Windows system DLLs.
+          ntldd -R package/pdf2htmlEX.exe > ntldd-report.txt
+          sed -nE 's/.*=>[[:space:]]*([^[:space:]]+\.dll).*/\1/ip' ntldd-report.txt | sort -fu |
+          while IFS= read -r dll; do
+            dep="$(cygpath -u "$dll" 2>/dev/null || true)"
+            case "$dep" in
+              /ucrt64/bin/*.dll)
+                if [ -f "$dep" ]; then cp -n "$dep" package/; fi
+                ;;
+            esac
+          done
+
+          # Basic smoke test: executable should start and report its version.
+          ./package/pdf2htmlEX.exe --version
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: pdf2htmlEX-windows-x64-portable
+          path: package/
+          if-no-files-found: error
