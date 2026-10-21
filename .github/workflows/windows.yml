@@ -1,4 +1,4 @@
-name: Build pdf2htmlEX native Windows x64 (v4 robust Poppler patch)
+name: Build pdf2htmlEX native Windows x86 and x64 (v5)
 
 on:
   workflow_dispatch:
@@ -12,16 +12,32 @@ permissions:
   contents: read
 
 jobs:
-  build-windows-x64:
+  build-windows:
+    name: Build pdf2htmlEX Windows ${{ matrix.arch }}
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            msystem: UCRT64
+            package_prefix: mingw-w64-ucrt-x86_64
+            extra_packages: mingw-w64-ucrt-x86_64-cairo mingw-w64-ucrt-x86_64-fontconfig
+            need_cairo_source: false
+          - arch: x86
+            msystem: MINGW32
+            package_prefix: mingw-w64-i686
+            extra_packages: mingw-w64-i686-meson mingw-w64-i686-ninja mingw-w64-i686-pixman
+            need_cairo_source: true
+
     steps:
       - name: Check out source
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
-      - name: Install MSYS2 UCRT64 toolchain and dependencies
+      - name: Install MSYS2 toolchain and dependencies (${{ matrix.arch }})
         uses: msys2/setup-msys2@v2
         with:
-          msystem: UCRT64
+          msystem: ${{ matrix.msystem }}
           update: true
           install: >-
             base-devel
@@ -31,40 +47,37 @@ jobs:
             patch
             python
             ruby
-            mingw-w64-ucrt-x86_64-toolchain
-            mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-make
-            mingw-w64-ucrt-x86_64-pkgconf
-            mingw-w64-ucrt-x86_64-cairo
-            mingw-w64-ucrt-x86_64-glib2
-            mingw-w64-ucrt-x86_64-freetype
-            mingw-w64-ucrt-x86_64-fontconfig
-            mingw-w64-ucrt-x86_64-libpng
-            mingw-w64-ucrt-x86_64-libjpeg-turbo
-            mingw-w64-ucrt-x86_64-libxml2
-            mingw-w64-ucrt-x86_64-openjpeg2
-            mingw-w64-ucrt-x86_64-zlib
-            mingw-w64-ucrt-x86_64-gettext
-            mingw-w64-ucrt-x86_64-libiconv
-            mingw-w64-ucrt-x86_64-lcms2
-            mingw-w64-ucrt-x86_64-ntldd
-            mingw-w64-ucrt-x86_64-gperf
+            ${{ matrix.package_prefix }}-toolchain
+            ${{ matrix.package_prefix }}-cmake
+            ${{ matrix.package_prefix }}-make
+            ${{ matrix.package_prefix }}-pkgconf
+            ${{ matrix.package_prefix }}-glib2
+            ${{ matrix.package_prefix }}-freetype
+            ${{ matrix.package_prefix }}-libpng
+            ${{ matrix.package_prefix }}-libjpeg-turbo
+            ${{ matrix.package_prefix }}-libxml2
+            ${{ matrix.package_prefix }}-openjpeg2
+            ${{ matrix.package_prefix }}-zlib
+            ${{ matrix.package_prefix }}-gettext
+            ${{ matrix.package_prefix }}-libiconv
+            ${{ matrix.package_prefix }}-lcms2
+            ${{ matrix.package_prefix }}-ntldd
+            ${{ matrix.extra_packages }}
 
-      - name: Prepare MinGW make wrapper and build environment
+      - name: Prepare make wrapper and build environment
         shell: msys2 {0}
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           mkdir -p .win-tools logs
 
-          # The upstream scripts invoke `make`, while the MinGW Makefiles
-          # generator expects mingw32-make. Route the script calls correctly.
           cat > .win-tools/make <<'EOF'
           #!/usr/bin/env bash
           exec mingw32-make "$@"
           EOF
           chmod +x .win-tools/make
 
-          # Use a native Windows path for CMake's install prefix.
           cat > .win-tools/env.sh <<'EOF'
           export PATH="$PWD/.win-tools:$PATH"
           export CMAKE_GENERATOR="MinGW Makefiles"
@@ -72,18 +85,25 @@ jobs:
           export MAKE_PARALLEL="-j2"
           export UNATTENDED="1"
           export PDF2HTMLEX_BRANCH="${GITHUB_REF_NAME:-master}"
+          export PKG_CONFIG_PATH="$MINGW_PREFIX/lib/pkgconfig:$MINGW_PREFIX/share/pkgconfig:${PKG_CONFIG_PATH:-}"
           EOF
 
           source .win-tools/env.sh
-          echo "Generator: $CMAKE_GENERATOR"
-          echo "Prefix: $PDF2HTMLEX_PREFIX"
-          echo "Branch/ref: $PDF2HTMLEX_BRANCH"
-          command -v gcc
-          command -v g++
-          command -v cmake
-          command -v mingw32-make
-          command -v make
-          printf 'Compiler and paths verified.\n' | tee logs/01-environment.log
+          {
+            echo "Build architecture: $BUILD_ARCH"
+            echo "MSYSTEM: ${MSYSTEM:-<unset>}"
+            echo "MINGW_PREFIX: ${MINGW_PREFIX:-<unset>}"
+            echo "Generator: $CMAKE_GENERATOR"
+            echo "Install prefix: $PDF2HTMLEX_PREFIX"
+            echo "Source ref: $PDF2HTMLEX_BRANCH"
+            command -v gcc
+            command -v g++
+            command -v cmake
+            command -v mingw32-make
+            command -v make
+            command -v pkgconf
+            gcc -dumpmachine
+          } 2>&1 | tee logs/01-environment.log
 
       - name: Resolve pinned source versions
         shell: msys2 {0}
@@ -119,8 +139,6 @@ jobs:
               raise SystemExit(f"Expected Poppler CMake file was not found: {cmake_file}")
 
           text = cmake_file.read_text(encoding="utf-8")
-          # Match the whole find_program call without assuming whether this
-          # Poppler release includes REQUIRED or wraps the arguments across lines.
           pattern = re.compile(r"(?is)(find_program\s*\(\s*GLIB2_MKENUMS\b)(.*?)(\))")
           match = pattern.search(text)
           if not match:
@@ -130,20 +148,18 @@ jobs:
               print("Matching lines:\n" + "\n".join(matching))
               raise SystemExit("Could not patch Poppler's GLib code generator.")
 
-          whole_call = match.group(0)
-          if "glib-mkenums-script.py" in whole_call:
-              print("Poppler GLib generator already points to glib-mkenums-script.py.")
-          else:
+          call = match.group(0)
+          if "glib-mkenums-script.py" not in call:
               body, count = re.subn(r"(?i)\bglib-mkenums\b",
                                     "glib-mkenums-script.py",
                                     match.group(2), count=1)
               if count != 1:
-                  print("Found GLIB2_MKENUMS declaration:", whole_call)
-                  raise SystemExit("GLIB2_MKENUMS declaration did not contain glib-mkenums.")
-              replacement = match.group(1) + body + match.group(3)
-              text = text[:match.start()] + replacement + text[match.end():]
+                  raise SystemExit(f"Could not replace generator in: {call}")
+              text = text[:match.start()] + match.group(1) + body + match.group(3) + text[match.end():]
               cmake_file.write_text(text, encoding="utf-8")
               print("Patched GLIB2_MKENUMS to use glib-mkenums-script.py.")
+          else:
+              print("GLIB2_MKENUMS already uses glib-mkenums-script.py.")
 
           final_text = cmake_file.read_text(encoding="utf-8")
           match = pattern.search(final_text)
@@ -151,55 +167,108 @@ jobs:
               raise SystemExit("Verification failed: GLIB2_MKENUMS was not updated.")
           print("Verified declaration:", match.group(0).replace("\n", " "))
           PYCODE
-            test -f "$MINGW_PREFIX/bin/glib-mkenums-script.py"
             grep -n -A2 -B1 'GLIB2_MKENUMS' poppler/glib/CMakeLists.txt
           } 2>&1 | tee logs/04-poppler-glib-generator-patch.log
+
+      - name: Build Cairo from source for 32-bit Windows
+        if: matrix.need_cairo_source
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          source .win-tools/env.sh
+          {
+            echo "Building Cairo for $MSYSTEM at $MINGW_PREFIX"
+            wget --https-only -q https://cairographics.org/releases/cairo-1.18.6.tar.xz -O cairo-1.18.6.tar.xz
+            echo '1c767308174337a74694da0f3ec069c271452163a1ef4540964c50c301f157d4  cairo-1.18.6.tar.xz' | sha256sum -c -
+            tar -xf cairo-1.18.6.tar.xz
+            meson setup cairo-1.18.6/build cairo-1.18.6 \
+              --prefix="$(cygpath -m "$MINGW_PREFIX")" \
+              --buildtype=release \
+              --default-library=shared \
+              -Dtests=disabled \
+              -Dfontconfig=disabled \
+              -Dfreetype=enabled \
+              -Dglib=enabled \
+              -Dzlib=enabled
+            ninja -C cairo-1.18.6/build
+            ninja -C cairo-1.18.6/build install
+            pkgconf --modversion cairo
+            pkgconf --cflags --libs cairo
+          } 2>&1 | tee logs/05-build-cairo.log
 
       - name: Build Poppler
         shell: msys2 {0}
         run: |
           set -euo pipefail
           source .win-tools/env.sh
-          bash ./buildScripts/buildPoppler 2>&1 | tee logs/05-build-poppler.log
+          bash ./buildScripts/buildPoppler 2>&1 | tee logs/06-build-poppler.log
 
       - name: Download FontForge sources
         shell: msys2 {0}
         run: |
           set -euo pipefail
           source .win-tools/env.sh
-          bash ./buildScripts/getFontforge 2>&1 | tee logs/06-get-fontforge.log
+          bash ./buildScripts/getFontforge 2>&1 | tee logs/07-get-fontforge.log
+
+      - name: Disable obsolete FontForge translation catalogs for this CLI build
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          {
+            python - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          cmake_file = Path("fontforge/CMakeLists.txt")
+          if not cmake_file.is_file():
+              raise SystemExit(f"FontForge CMakeLists not found: {cmake_file}")
+          text = cmake_file.read_text(encoding="utf-8")
+          marker = "# PDF2HTMLEX_WINDOWS_BUILD: translation catalogs skipped"
+          if marker in text:
+              print("FontForge translation step is already disabled.")
+          else:
+              pattern = re.compile(r"(?im)^[ \t]*add_subdirectory[ \t]*\([ \t]*po[ \t]*\)[ \t]*(?:#.*)?$")
+              updated, count = pattern.subn(marker, text)
+              if count != 1:
+                  candidates = [line for line in text.splitlines()
+                                if "add_subdirectory" in line.lower() and "po" in line.lower()]
+                  print("Candidate CMake lines:\n" + "\n".join(candidates))
+                  raise SystemExit(f"Expected one add_subdirectory(po) line, found {count}")
+              cmake_file.write_text(updated, encoding="utf-8")
+              print("Disabled PO catalog compilation; the pdf2htmlEX CLI build does not need translated FontForge UI catalogs.")
+          verify = cmake_file.read_text(encoding="utf-8")
+          if marker not in verify:
+              raise SystemExit("FontForge translation-disable patch did not persist")
+          PYCODE
+            grep -n 'PDF2HTMLEX_WINDOWS_BUILD: translation catalogs skipped' fontforge/CMakeLists.txt
+          } 2>&1 | tee logs/08-fontforge-translation-patch.log
 
       - name: Build FontForge
         shell: msys2 {0}
         run: |
           set -euo pipefail
           source .win-tools/env.sh
-          bash ./buildScripts/buildFontforge 2>&1 | tee logs/07-build-fontforge.log
+          bash ./buildScripts/buildFontforge 2>&1 | tee logs/09-build-fontforge.log
 
       - name: Build pdf2htmlEX.exe
         shell: msys2 {0}
         run: |
           set -euo pipefail
           source .win-tools/env.sh
-          bash ./buildScripts/buildPdf2htmlEX 2>&1 | tee logs/08-build-pdf2htmlEX.log
+          bash ./buildScripts/buildPdf2htmlEX 2>&1 | tee logs/10-build-pdf2htmlEX.log
 
       - name: Assemble portable directory and bundle runtime DLLs
         shell: msys2 {0}
         run: |
           set -euo pipefail
+          source .win-tools/env.sh
           mkdir -p package/poppler
           cp pdf2htmlEX/build/pdf2htmlEX.exe package/
-
-          # On MinGW the program defaults to the executable directory for
-          # its resource data, and to <exe-dir>/poppler for Poppler CMaps.
           cp -a pdf2htmlEX/share/. package/
           cp -a poppler-data/. package/poppler/
 
-          ntldd -R package/pdf2htmlEX.exe 2>&1 | tee logs/09-dll-dependencies.log
-
-          # Collect all dependencies found by ntldd from the UCRT64 prefix.
-          # DLLs belonging to Windows itself are not present in this prefix.
-          grep -oiE '[[:alnum:]_.+-]+\.dll' logs/09-dll-dependencies.log | sort -fu |
+          ntldd -R package/pdf2htmlEX.exe 2>&1 | tee logs/11-dll-dependencies.log
+          grep -oiE '[[:alnum:]_.+-]+\.dll' logs/11-dll-dependencies.log | sort -fu |
           while IFS= read -r dll; do
             if [ -f "$MINGW_PREFIX/bin/$dll" ]; then
               cp -n "$MINGW_PREFIX/bin/$dll" package/
@@ -208,26 +277,78 @@ jobs:
 
           test -f package/pdf2htmlEX.exe
           test -d package/poppler
-          ls -la package | tee logs/10-package-list.log
+          ls -la package | tee logs/11-package-list.log
 
-      - name: Smoke test Windows executable
+      - name: Verify executable architecture and smoke-test
         shell: msys2 {0}
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          ./package/pdf2htmlEX.exe --version 2>&1 | tee logs/11-smoke-test.log
+          python - <<'PYCODE'
+          import os, struct
+          from pathlib import Path
+          path = Path("package/pdf2htmlEX.exe")
+          data = path.read_bytes()
+          if data[:2] != b"MZ":
+              raise SystemExit("Output is not a valid Windows PE executable")
+          pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+          if data[pe_offset:pe_offset + 4] != b"PE\0\0":
+              raise SystemExit("Missing PE signature")
+          machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
+          expected = {"x86": 0x014C, "x64": 0x8664}[os.environ["BUILD_ARCH"]]
+          print(f"PE machine=0x{machine:04x}; expected=0x{expected:04x}; architecture={os.environ['BUILD_ARCH']}")
+          if machine != expected:
+              raise SystemExit("The generated executable architecture does not match the matrix job")
+          PYCODE
+          ./package/pdf2htmlEX.exe --version 2>&1 | tee logs/12-smoke-test.log
 
       - name: Upload diagnostic logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: pdf2htmlEX-windows-build-logs
+          name: pdf2htmlEX-windows-${{ matrix.arch }}-build-logs
           path: logs/
           if-no-files-found: warn
 
       - name: Upload portable Windows build
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: pdf2htmlEX-windows-x64-portable
+          name: pdf2htmlEX-windows-${{ matrix.arch }}-portable
           path: package/
+          if-no-files-found: error
+
+
+  combine-portable-builds:
+    name: Combine x86 and x64 portable builds
+    needs: build-windows
+    if: needs.build-windows.result == 'success'
+    runs-on: windows-2022
+    steps:
+      - name: Download both architecture builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: pdf2htmlEX-windows-*-portable
+          path: combined
+          merge-multiple: false
+
+      - name: Verify both architectures are present
+        id: verify
+        shell: pwsh
+        run: |
+          $x64 = Test-Path 'combined/pdf2htmlEX-windows-x64-portable/pdf2htmlEX.exe'
+          $x86 = Test-Path 'combined/pdf2htmlEX-windows-x86-portable/pdf2htmlEX.exe'
+          if ($x64 -and $x86) {
+            'ready=true' >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Error "Missing executable(s): x64=$x64, x86=$x86"
+          }
+
+      - name: Upload combined x86 and x64 package
+        if: steps.verify.outputs.ready == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pdf2htmlEX-windows-x86-x64-portable
+          path: combined/
           if-no-files-found: error
