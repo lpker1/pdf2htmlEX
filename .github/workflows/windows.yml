@@ -1,4 +1,4 @@
-name: Build pdf2htmlEX native Windows x64
+name: Build pdf2htmlEX native Windows x64 (v4 robust Poppler patch)
 
 on:
   workflow_dispatch:
@@ -103,29 +103,57 @@ jobs:
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          python - <<'PYCODE'
+          {
+            echo "MINGW_PREFIX=${MINGW_PREFIX:-<unset>}"
+            echo "Python: $(command -v python)"
+            echo "CMake: $(command -v cmake)"
+            test -n "${MINGW_PREFIX:-}"
+            test -f "$MINGW_PREFIX/bin/glib-mkenums-script.py"
+
+            python - <<'PYCODE'
           from pathlib import Path
+          import re
 
           cmake_file = Path("poppler/glib/CMakeLists.txt")
           if not cmake_file.is_file():
               raise SystemExit(f"Expected Poppler CMake file was not found: {cmake_file}")
 
           text = cmake_file.read_text(encoding="utf-8")
-          old = "find_program(GLIB2_MKENUMS glib-mkenums REQUIRED)"
-          new = "find_program(GLIB2_MKENUMS glib-mkenums-script.py REQUIRED)"
-          if new in text:
-              print("Poppler GLib generator path is already patched.")
-          elif old in text:
-              cmake_file.write_text(text.replace(old, new, 1), encoding="utf-8")
-              print("Patched GLIB2_MKENUMS to use glib-mkenums-script.py.")
+          # Match the whole find_program call without assuming whether this
+          # Poppler release includes REQUIRED or wraps the arguments across lines.
+          pattern = re.compile(r"(?is)(find_program\s*\(\s*GLIB2_MKENUMS\b)(.*?)(\))")
+          match = pattern.search(text)
+          if not match:
+              matching = [line for line in text.splitlines()
+                          if "GLIB2_MKENUMS" in line or "glib-mkenums" in line]
+              print("No find_program(GLIB2_MKENUMS ...) declaration found.")
+              print("Matching lines:\n" + "\n".join(matching))
+              raise SystemExit("Could not patch Poppler's GLib code generator.")
+
+          whole_call = match.group(0)
+          if "glib-mkenums-script.py" in whole_call:
+              print("Poppler GLib generator already points to glib-mkenums-script.py.")
           else:
-              matching = [line for line in text.splitlines() if "GLIB2_MKENUMS" in line or "glib-mkenums" in line]
-              print("Could not find the expected Poppler CMake line. Matching lines:")
-              print("\n".join(matching))
-              raise SystemExit("Poppler GLib generator patch did not apply; refusing to continue.")
+              body, count = re.subn(r"(?i)\bglib-mkenums\b",
+                                    "glib-mkenums-script.py",
+                                    match.group(2), count=1)
+              if count != 1:
+                  print("Found GLIB2_MKENUMS declaration:", whole_call)
+                  raise SystemExit("GLIB2_MKENUMS declaration did not contain glib-mkenums.")
+              replacement = match.group(1) + body + match.group(3)
+              text = text[:match.start()] + replacement + text[match.end():]
+              cmake_file.write_text(text, encoding="utf-8")
+              print("Patched GLIB2_MKENUMS to use glib-mkenums-script.py.")
+
+          final_text = cmake_file.read_text(encoding="utf-8")
+          match = pattern.search(final_text)
+          if not match or "glib-mkenums-script.py" not in match.group(0):
+              raise SystemExit("Verification failed: GLIB2_MKENUMS was not updated.")
+          print("Verified declaration:", match.group(0).replace("\n", " "))
           PYCODE
-          test -f "$MINGW_PREFIX/bin/glib-mkenums-script.py"
-          grep -n 'GLIB2_MKENUMS' poppler/glib/CMakeLists.txt | tee logs/04-poppler-glib-generator-patch.log
+            test -f "$MINGW_PREFIX/bin/glib-mkenums-script.py"
+            grep -n -A2 -B1 'GLIB2_MKENUMS' poppler/glib/CMakeLists.txt
+          } 2>&1 | tee logs/04-poppler-glib-generator-patch.log
 
       - name: Build Poppler
         shell: msys2 {0}
