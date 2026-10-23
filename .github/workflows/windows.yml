@@ -1,4 +1,4 @@
-name: Build pdf2htmlEX native Windows x86 and x64 (v7)
+name: Build pdf2htmlEX native Windows x86 and x64 with Unicode and one-file wrapper (v8)
 
 on:
   workflow_dispatch:
@@ -27,14 +27,14 @@ jobs:
           - arch: x86
             msystem: MINGW32
             package_prefix: mingw-w64-i686
-            extra_packages: mingw-w64-i686-meson mingw-w64-i686-ninja mingw-w64-i686-pixman
+            extra_packages: mingw-w64-i686-pixman
             need_cairo_source: true
 
     steps:
       - name: Check out source
         uses: actions/checkout@v7
 
-      - name: Install MSYS2 toolchain and dependencies (${{ matrix.arch }})
+      - name: Install MSYS2 base tools (${{ matrix.arch }})
         uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
@@ -47,22 +47,43 @@ jobs:
             patch
             python
             ruby
-            ${{ matrix.package_prefix }}-toolchain
-            ${{ matrix.package_prefix }}-cmake
-            ${{ matrix.package_prefix }}-make
-            ${{ matrix.package_prefix }}-pkgconf
-            ${{ matrix.package_prefix }}-glib2
-            ${{ matrix.package_prefix }}-freetype
-            ${{ matrix.package_prefix }}-libpng
-            ${{ matrix.package_prefix }}-libjpeg-turbo
-            ${{ matrix.package_prefix }}-libxml2
-            ${{ matrix.package_prefix }}-openjpeg2
-            ${{ matrix.package_prefix }}-zlib
-            ${{ matrix.package_prefix }}-gettext
-            ${{ matrix.package_prefix }}-libiconv
-            ${{ matrix.package_prefix }}-lcms2
-            ${{ matrix.package_prefix }}-ntldd
-            ${{ matrix.extra_packages }}
+            meson
+            ninja
+
+      - name: Install architecture compiler and libraries (${{ matrix.arch }})
+        shell: msys2 {0}
+        env:
+          PACKAGE_PREFIX: ${{ matrix.package_prefix }}
+          EXTRA_PACKAGES: ${{ matrix.extra_packages }}
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          {
+            echo "MSYSTEM=$MSYSTEM"
+            echo "PACKAGE_PREFIX=$PACKAGE_PREFIX"
+            echo "Installing explicit compiler packages instead of the deprecated MINGW32 toolchain group"
+            read -r -a extra <<< "$EXTRA_PACKAGES"
+            packages=(
+              "$PACKAGE_PREFIX-gcc"
+              "$PACKAGE_PREFIX-binutils"
+              "$PACKAGE_PREFIX-cmake"
+              "$PACKAGE_PREFIX-make"
+              "$PACKAGE_PREFIX-pkgconf"
+              "$PACKAGE_PREFIX-glib2"
+              "$PACKAGE_PREFIX-freetype"
+              "$PACKAGE_PREFIX-libpng"
+              "$PACKAGE_PREFIX-libjpeg-turbo"
+              "$PACKAGE_PREFIX-libxml2"
+              "$PACKAGE_PREFIX-openjpeg2"
+              "$PACKAGE_PREFIX-zlib"
+              "$PACKAGE_PREFIX-gettext"
+              "$PACKAGE_PREFIX-libiconv"
+              "$PACKAGE_PREFIX-lcms2"
+            )
+            packages+=("${extra[@]}")
+            printf 'Requested package: %s\n' "${packages[@]}"
+            pacman -S --needed --noconfirm "${packages[@]}"
+          } 2>&1 | tee logs/00-architecture-packages.log
 
       - name: Prepare make wrapper and build environment
         shell: msys2 {0}
@@ -297,6 +318,111 @@ jobs:
             grep -n -A8 -B2 'LIB_INTL_LIBRARIES' pdf2htmlEX/CMakeLists.txt
           } 2>&1 | tee logs/10-gettext-iconv-link-patch.log
 
+      - name: Patch Windows Unicode command-line and output paths
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          {
+            python - <<'PYCODE'
+          from pathlib import Path
+          import re
+
+          main = Path("pdf2htmlEX/src/pdf2htmlEX.cc")
+          text = main.read_text(encoding="utf-8")
+          old_include = '#ifdef __MINGW32__\n#include "util/mingw.h"\n#endif'
+          new_include = '#ifdef __MINGW32__\n#ifndef NOMINMAX\n#define NOMINMAX\n#endif\n#include "util/mingw.h"\n#include <windows.h>\n#include <vector>\n#include <utility>\n#include <cwchar>\n#endif'
+          if new_include not in text:
+              if old_include not in text:
+                  raise SystemExit("Could not find MinGW include block in pdf2htmlEX.cc")
+              text = text.replace(old_include, new_include, 1)
+          signature = "int main(int argc, char **argv)"
+          if signature in text:
+              text = text.replace(signature, "int pdf2htmlEX_main(int argc, char **argv)", 1)
+          elif "int pdf2htmlEX_main(int argc, char **argv)" not in text:
+              raise SystemExit("Could not find main() in pdf2htmlEX.cc")
+          wrapper = r'''
+
+          #ifdef __MINGW32__
+          static std::string pdf2htmlEX_wide_to_utf8(const wchar_t *value)
+          {
+              if (value == nullptr) return std::string();
+              int needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1, nullptr, 0, nullptr, nullptr);
+              if (needed <= 0) return std::string();
+              std::string result(static_cast<size_t>(needed), '\0');
+              if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1, &result[0], needed, nullptr, nullptr) <= 0)
+                  return std::string();
+              result.resize(static_cast<size_t>(needed - 1));
+              return result;
+          }
+
+          int wmain(int argc, wchar_t **wargv)
+          {
+              std::vector<std::string> utf8_storage;
+              std::vector<char *> utf8_argv;
+              utf8_storage.reserve(static_cast<size_t>(argc));
+              utf8_argv.reserve(static_cast<size_t>(argc) + 1);
+              for (int i = 0; i < argc; ++i)
+              {
+                  std::string arg = pdf2htmlEX_wide_to_utf8(wargv[i]);
+                  if (wargv[i] != nullptr && arg.empty() && wargv[i][0] != L'\0')
+                  {
+                      std::fwprintf(stderr, L"Cannot convert command-line argument to UTF-8.\n");
+                      return EXIT_FAILURE;
+                  }
+                  utf8_storage.emplace_back(std::move(arg));
+              }
+              for (auto &arg : utf8_storage)
+                  utf8_argv.push_back(const_cast<char *>(arg.c_str()));
+              utf8_argv.push_back(nullptr);
+              return pdf2htmlEX_main(argc, utf8_argv.data());
+          }
+          #else
+          int main(int argc, char **argv)
+          {
+              return pdf2htmlEX_main(argc, argv);
+          }
+          #endif
+          '''
+          if "int wmain(int argc, wchar_t **wargv)" not in text:
+              text = text.rstrip() + wrapper + "\n"
+          main.write_text(text, encoding="utf-8")
+
+          general = Path("pdf2htmlEX/src/HTMLRenderer/general.cc")
+          gt = general.read_text(encoding="utf-8")
+          if "#include <filesystem>" not in gt:
+              gt = gt.replace("#include <cstdio>", "#include <cstdio>\n#include <filesystem>", 1)
+          replacements = [
+              ("new ofstream((char*)page_fn, ofstream::binary)", "new ofstream(std::filesystem::u8path((char*)page_fn), ofstream::binary)"),
+              ("f_css.fs.open(f_css.path, ofstream::binary)", "f_css.fs.open(std::filesystem::u8path(f_css.path), ofstream::binary)"),
+              ("f_outline.fs.open(f_outline.path, ofstream::binary)", "f_outline.fs.open(std::filesystem::u8path(f_outline.path), ofstream::binary)"),
+              ("f_pages.fs.open(f_pages.path, ofstream::binary)", "f_pages.fs.open(std::filesystem::u8path(f_pages.path), ofstream::binary)"),
+              ("output.open((char*)fn, ofstream::binary)", "output.open(std::filesystem::u8path((char*)fn), ofstream::binary)"),
+              ("ifstream manifest_fin((char*)str_fmt(\"%s/%s\", param.data_dir.c_str(), MANIFEST_FILENAME.c_str()), ifstream::binary);", "ifstream manifest_fin(std::filesystem::u8path((char*)str_fmt(\"%s/%s\", param.data_dir.c_str(), MANIFEST_FILENAME.c_str())), ifstream::binary);"),
+              ("ifstream fin(f_outline.path, ifstream::binary)", "ifstream fin(std::filesystem::u8path(f_outline.path), ifstream::binary)"),
+              ("ifstream fin(f_pages.path, ifstream::binary)", "ifstream fin(std::filesystem::u8path(f_pages.path), ifstream::binary)"),
+              ("ifstream fin(path, ifstream::binary)", "ifstream fin(std::filesystem::u8path(path), ifstream::binary)"),
+              ("ofstream out(out_path, ofstream::binary)", "ofstream out(std::filesystem::u8path(out_path), ofstream::binary)"),
+          ]
+          for old, new in replacements:
+              if old in gt:
+                  gt = gt.replace(old, new)
+              elif new not in gt:
+                  raise SystemExit("Expected Unicode path substitution was not found: " + old)
+          general.write_text(gt, encoding="utf-8")
+
+          cmake = Path("pdf2htmlEX/CMakeLists.txt")
+          ct = cmake.read_text(encoding="utf-8")
+          marker = "target_link_libraries(pdf2htmlEX ${PDF2HTMLEX_LIBS})"
+          unicode_link = marker + "\nif (MINGW)\n  target_link_options(pdf2htmlEX PRIVATE -municode)\nendif()"
+          if "target_link_options(pdf2htmlEX PRIVATE -municode)" not in ct:
+              if marker not in ct:
+                  raise SystemExit("Could not locate target_link_libraries in CMakeLists.txt")
+              ct = ct.replace(marker, unicode_link, 1)
+          cmake.write_text(ct, encoding="utf-8")
+          print("Patched wmain UTF-16 -> UTF-8 argv, filesystem UTF-8 paths, and MinGW -municode linker option.")
+          PYCODE
+          } 2>&1 | tee logs/11-windows-unicode-patch.log
+
       - name: Build pdf2htmlEX.exe (CMake 4 and MinGW gettext compatibility)
         shell: msys2 {0}
         run: |
@@ -311,29 +437,68 @@ jobs:
             CMAKE_POLICY_VERSION_MINIMUM=3.5 bash ./buildScripts/buildPdf2htmlEX
           } 2>&1 | tee logs/10-build-pdf2htmlEX.log
 
-      - name: Assemble portable directory and bundle runtime DLLs
+      - name: Assemble portable directory and resolve runtime DLL dependencies
         shell: msys2 {0}
         run: |
           set -euo pipefail
           source .win-tools/env.sh
-          mkdir -p package/poppler
+          mkdir -p package/data/poppler
           cp pdf2htmlEX/build/pdf2htmlEX.exe package/
-          cp -a pdf2htmlEX/share/. package/
-          cp -a poppler-data/. package/poppler/
+          cp -a pdf2htmlEX/share/. package/data/
+          cp -a poppler-data/. package/data/poppler/
 
-          ntldd -R package/pdf2htmlEX.exe 2>&1 | tee logs/11-dll-dependencies.log
-          grep -oiE '[[:alnum:]_.+-]+\.dll' logs/11-dll-dependencies.log | sort -fu |
-          while IFS= read -r dll; do
-            if [ -f "$MINGW_PREFIX/bin/$dll" ]; then
-              cp -n "$MINGW_PREFIX/bin/$dll" package/
-            fi
-          done
+          python - <<'PYCODE'
+          import os, re, shutil, subprocess
+          from collections import deque
+          from pathlib import Path
 
-          test -f package/pdf2htmlEX.exe
-          test -d package/poppler
-          ls -la package | tee logs/11-package-list.log
+          package = Path("package")
+          exe = package / "pdf2htmlEX.exe"
+          bindir = Path(os.environ["MINGW_PREFIX"]) / "bin"
+          objdump = bindir / "objdump.exe"
+          if not exe.is_file() or not objdump.is_file():
+              raise SystemExit("Expected executable or architecture objdump tool is missing")
 
-      - name: Verify executable architecture and smoke-test
+          queue = deque([exe])
+          seen_images = set()
+          copied = set()
+          while queue:
+              image = queue.popleft()
+              try:
+                  key = str(image.resolve()).lower()
+              except OSError:
+                  key = str(image).lower()
+              if key in seen_images:
+                  continue
+              seen_images.add(key)
+              result = subprocess.run([str(objdump), "-p", str(image)], capture_output=True, text=True, errors="replace")
+              if result.returncode != 0:
+                  print(f"Warning: objdump failed for {image}: {result.stderr}")
+                  continue
+              imports = re.findall(r"^\s*DLL Name:\s*([^\s]+)", result.stdout, flags=re.M | re.I)
+              for dll in imports:
+                  src = bindir / dll
+                  if not src.is_file():
+                      continue  # Windows system/API-set DLL, or a non-MinGW dependency.
+                  key = dll.lower()
+                  dst = package / dll
+                  if key not in copied:
+                      if not dst.exists():
+                          shutil.copy2(src, dst)
+                          print(f"Bundled runtime DLL: {dll}")
+                      copied.add(key)
+                      queue.append(src)
+
+          print(f"Runtime DLLs bundled: {len(copied)}")
+          if not (package / "data" / "manifest").is_file():
+              raise SystemExit("Packaging error: package/data/manifest is missing")
+          if not (package / "data" / "poppler").is_dir():
+              raise SystemExit("Packaging error: package/data/poppler is missing")
+          PYCODE
+          ls -la package | tee logs/12-package-list.log
+          find package/data -maxdepth 2 -type f | head -60 | tee logs/12-data-list.log
+
+      - name: Verify raw executable architecture and version
         shell: msys2 {0}
         env:
           BUILD_ARCH: ${{ matrix.arch }}
@@ -355,7 +520,286 @@ jobs:
           if machine != expected:
               raise SystemExit("The generated executable architecture does not match the matrix job")
           PYCODE
-          ./package/pdf2htmlEX.exe --version 2>&1 | tee logs/12-smoke-test.log
+          ./package/pdf2htmlEX.exe --version 2>&1 | tee logs/13-raw-version-test.log
+
+      - name: Build one-file self-extracting Windows launcher
+        shell: msys2 {0}
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p onefile .win-tools
+          cat > .win-tools/pdf2htmlex_onefile_stub.cpp <<'CPP'
+          #define WIN32_LEAN_AND_MEAN
+          #include <windows.h>
+          #include <cstdint>
+          #include <cstring>
+          #include <cstdio>
+          #include <cwchar>
+          #include <string>
+          #include <vector>
+
+          struct Footer { char magic[8]; std::uint64_t offset; std::uint64_t size; };
+          static const char kMagic[8] = {'P','2','H','T','A','R','1','\0'};
+
+          static bool read_exact(HANDLE h, void *buffer, DWORD bytes) {
+              char *p = static_cast<char *>(buffer);
+              DWORD total = 0;
+              while (total < bytes) {
+                  DWORD got = 0;
+                  if (!ReadFile(h, p + total, bytes - total, &got, nullptr) || got == 0) return false;
+                  total += got;
+              }
+              return true;
+          }
+          static std::wstring utf8_to_wide(const std::string &s) {
+              if (s.empty()) return std::wstring();
+              int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int)s.size(), nullptr, 0);
+              if (n <= 0) return std::wstring();
+              std::wstring w((size_t)n, L'\0');
+              if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.data(), (int)s.size(), &w[0], n) != n) return std::wstring();
+              return w;
+          }
+          static std::wstring quote_arg(const std::wstring &arg) {
+              if (!arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos) return arg;
+              std::wstring out = L"\"";
+              size_t slashes = 0;
+              for (wchar_t ch : arg) {
+                  if (ch == L'\\') { ++slashes; continue; }
+                  if (ch == L'\"') { out.append(slashes * 2 + 1, L'\\'); out += L'\"'; slashes = 0; continue; }
+                  out.append(slashes, L'\\'); slashes = 0; out += ch;
+              }
+              out.append(slashes * 2, L'\\');
+              out += L'\"';
+              return out;
+          }
+          static bool create_dirs(const std::wstring &path) {
+              std::wstring current;
+              size_t start = 0;
+              if (path.size() >= 3 && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) {
+                  current = path.substr(0, 3); start = 3;
+              } else if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') {
+                  size_t a = path.find(L'\\', 2); if (a == std::wstring::npos) return false;
+                  size_t b = path.find(L'\\', a + 1); if (b == std::wstring::npos) { CreateDirectoryW(path.c_str(), nullptr); return true; }
+                  current = path.substr(0, b + 1); start = b + 1;
+              }
+              for (size_t i = start; i < path.size(); ++i) {
+                  current += path[i];
+                  if (path[i] == L'\\' || path[i] == L'/') {
+                      if (!current.empty()) CreateDirectoryW(current.c_str(), nullptr);
+                  }
+              }
+              if (!CreateDirectoryW(path.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+              return true;
+          }
+          static bool safe_relative_path(std::string &p) {
+              for (char &c : p) if (c == '\\') c = '/';
+              while (p.rfind("./", 0) == 0) p.erase(0, 2);
+              if (p.empty() || p == ".") return true;
+              if (p[0] == '/' || p.find(':') != std::string::npos) return false;
+              size_t pos = 0;
+              while (pos <= p.size()) {
+                  size_t end = p.find('/', pos);
+                  std::string part = p.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+                  if (part == "..") return false;
+                  if (end == std::string::npos) break;
+                  pos = end + 1;
+              }
+              return true;
+          }
+          static std::uint64_t parse_octal(const unsigned char *p, size_t n) {
+              std::uint64_t value = 0; bool seen = false;
+              for (size_t i = 0; i < n; ++i) {
+                  if (p[i] == 0 || p[i] == ' ') { if (seen) break; else continue; }
+                  if (p[i] < '0' || p[i] > '7') return 0;
+                  seen = true; value = value * 8 + (p[i] - '0');
+              }
+              return value;
+          }
+          static std::string field_string(const unsigned char *p, size_t n) {
+              size_t len = 0; while (len < n && p[len] != 0) ++len;
+              return std::string(reinterpret_cast<const char *>(p), len);
+          }
+          static bool extract_tar(const std::vector<unsigned char> &tar, const std::wstring &root) {
+              size_t off = 0;
+              while (off + 512 <= tar.size()) {
+                  const unsigned char *h = tar.data() + off;
+                  bool zero = true; for (size_t i = 0; i < 512; ++i) if (h[i] != 0) { zero = false; break; }
+                  if (zero) break;
+                  std::string name = field_string(h, 100);
+                  std::string prefix = field_string(h + 345, 155);
+                  if (!prefix.empty()) name = prefix + "/" + name;
+                  std::uint64_t size = parse_octal(h + 124, 12);
+                  char type = (char)h[156];
+                  size_t dataoff = off + 512;
+                  if (size > tar.size() || dataoff > tar.size() || size > tar.size() - dataoff) return false;
+                  if (!safe_relative_path(name)) return false;
+                  if (!name.empty() && name != ".") {
+                      std::wstring rel = utf8_to_wide(name);
+                      if (rel.empty()) return false;
+                      for (wchar_t &c : rel) if (c == L'/') c = L'\\';
+                      std::wstring full = root + L"\\" + rel;
+                      if (type == '5') {
+                          if (!create_dirs(full)) return false;
+                      } else if (type == 0 || type == '0') {
+                          size_t last = full.find_last_of(L"\\/");
+                          if (last != std::wstring::npos && !create_dirs(full.substr(0, last))) return false;
+                          HANDLE out = CreateFileW(full.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                          if (out == INVALID_HANDLE_VALUE) return false;
+                          size_t written = 0; bool ok = true;
+                          while (written < size) {
+                              DWORD chunk = (DWORD)((size - written) > 1024 * 1024 ? 1024 * 1024 : (size - written));
+                              DWORD done = 0;
+                              if (!WriteFile(out, tar.data() + dataoff + written, chunk, &done, nullptr) || done != chunk) { ok = false; break; }
+                              written += done;
+                          }
+                          CloseHandle(out);
+                          if (!ok) return false;
+                      } else {
+                          return false; // only regular files and directories are expected in the payload
+                      }
+                  }
+                  std::uint64_t padded = ((size + 511) / 512) * 512;
+                  if (padded > tar.size() - dataoff) return false;
+                  off = dataoff + (size_t)padded;
+              }
+              return true;
+          }
+          static void remove_tree(const std::wstring &dir) {
+              std::wstring pattern = dir + L"\\*";
+              WIN32_FIND_DATAW fd;
+              HANDLE find = FindFirstFileW(pattern.c_str(), &fd);
+              if (find != INVALID_HANDLE_VALUE) {
+                  do {
+                      if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+                      std::wstring child = dir + L"\\" + fd.cFileName;
+                      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(child);
+                      else { SetFileAttributesW(child.c_str(), FILE_ATTRIBUTE_NORMAL); DeleteFileW(child.c_str()); }
+                  } while (FindNextFileW(find, &fd));
+                  FindClose(find);
+              }
+              SetFileAttributesW(dir.c_str(), FILE_ATTRIBUTE_NORMAL);
+              RemoveDirectoryW(dir.c_str());
+          }
+          int wmain(int argc, wchar_t **argv) {
+              wchar_t self[32768];
+              DWORD selfLen = GetModuleFileNameW(nullptr, self, (DWORD)(sizeof(self) / sizeof(self[0])));
+              if (selfLen == 0 || selfLen >= sizeof(self) / sizeof(self[0])) { fwprintf(stderr, L"Cannot locate this executable.\n"); return 1; }
+              HANDLE file = CreateFileW(self, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+              if (file == INVALID_HANDLE_VALUE) { fwprintf(stderr, L"Cannot open the one-file executable.\n"); return 1; }
+              LARGE_INTEGER fileSize;
+              if (!GetFileSizeEx(file, &fileSize) || fileSize.QuadPart < (LONGLONG)sizeof(Footer)) { CloseHandle(file); fwprintf(stderr, L"Invalid one-file executable.\n"); return 1; }
+              LARGE_INTEGER pos; pos.QuadPart = fileSize.QuadPart - sizeof(Footer);
+              if (!SetFilePointerEx(file, pos, nullptr, FILE_BEGIN)) { CloseHandle(file); return 1; }
+              Footer foot{};
+              if (!read_exact(file, &foot, sizeof(foot)) || memcmp(foot.magic, kMagic, sizeof(kMagic)) != 0 || foot.offset + foot.size + sizeof(Footer) != (std::uint64_t)fileSize.QuadPart || foot.size > (std::uint64_t)SIZE_MAX) {
+                  CloseHandle(file); fwprintf(stderr, L"Embedded runtime payload is missing or corrupt.\n"); return 1;
+              }
+              std::vector<unsigned char> tar((size_t)foot.size);
+              pos.QuadPart = (LONGLONG)foot.offset;
+              if (!SetFilePointerEx(file, pos, nullptr, FILE_BEGIN) || !read_exact(file, tar.data(), (DWORD)tar.size())) {
+                  CloseHandle(file); fwprintf(stderr, L"Cannot read embedded runtime payload.\n"); return 1;
+              }
+              CloseHandle(file);
+              wchar_t tempBase[32768]; DWORD tempLen = GetTempPathW((DWORD)(sizeof(tempBase) / sizeof(tempBase[0])), tempBase);
+              if (tempLen == 0 || tempLen >= sizeof(tempBase) / sizeof(tempBase[0])) { fwprintf(stderr, L"Cannot locate the temporary directory.\n"); return 1; }
+              wchar_t tempName[MAX_PATH];
+              if (!GetTempFileNameW(tempBase, L"p2h", 0, tempName)) { fwprintf(stderr, L"Cannot create temporary directory name.\n"); return 1; }
+              DeleteFileW(tempName);
+              if (!CreateDirectoryW(tempName, nullptr)) { fwprintf(stderr, L"Cannot create temporary extraction directory.\n"); return 1; }
+              std::wstring root = tempName;
+              if (!extract_tar(tar, root)) { remove_tree(root); fwprintf(stderr, L"Cannot extract embedded runtime payload.\n"); return 1; }
+              std::wstring child = root + L"\\pdf2htmlEX.exe";
+              std::wstring command = quote_arg(child);
+              for (int i = 1; i < argc; ++i) { command += L" "; command += quote_arg(argv[i]); }
+              std::vector<wchar_t> writable(command.begin(), command.end()); writable.push_back(L'\0');
+              STARTUPINFOW si{}; si.cb = sizeof(si);
+              HANDLE in = GetStdHandle(STD_INPUT_HANDLE), out = GetStdHandle(STD_OUTPUT_HANDLE), err = GetStdHandle(STD_ERROR_HANDLE);
+              if (in && in != INVALID_HANDLE_VALUE && out && out != INVALID_HANDLE_VALUE && err && err != INVALID_HANDLE_VALUE) {
+                  si.dwFlags = STARTF_USESTDHANDLES; si.hStdInput = in; si.hStdOutput = out; si.hStdError = err;
+              }
+              PROCESS_INFORMATION pi{};
+              BOOL started = CreateProcessW(child.c_str(), writable.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
+              if (!started) { DWORD e = GetLastError(); remove_tree(root); fwprintf(stderr, L"Cannot start pdf2htmlEX (Windows error %lu).\n", (unsigned long)e); return 1; }
+              CloseHandle(pi.hThread); WaitForSingleObject(pi.hProcess, INFINITE);
+              DWORD exitCode = 1; GetExitCodeProcess(pi.hProcess, &exitCode); CloseHandle(pi.hProcess);
+              remove_tree(root);
+              return (int)exitCode;
+          }
+          CPP
+          g++ -std=c++17 -Os -s -static -static-libgcc -static-libstdc++ -municode .win-tools/pdf2htmlex_onefile_stub.cpp -o .win-tools/pdf2htmlEX-onefile-stub.exe
+          tar --format=ustar -cf .win-tools/pdf2htmlex-runtime.tar -C package .
+          python - <<'PYCODE'
+          from pathlib import Path
+          import struct
+          stub = Path(".win-tools/pdf2htmlEX-onefile-stub.exe").read_bytes()
+          payload = Path(".win-tools/pdf2htmlex-runtime.tar").read_bytes()
+          out = Path("onefile") / f"pdf2htmlEX-${{ matrix.arch }}-onefile.exe"
+          with out.open("wb") as f:
+              f.write(stub)
+              f.write(payload)
+              f.write(struct.pack("<8sQQ", b"P2HTAR1\0", len(stub), len(payload)))
+          print(f"Wrote self-extracting file: {out} ({out.stat().st_size:,} bytes)")
+          PYCODE
+
+      - name: Set up Python for Unicode conversion test
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Test raw and one-file builds with Chinese input and output paths
+        shell: pwsh
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $testRoot = Join-Path $env:RUNNER_TEMP 'pdf2htmlEX-UTF8-test'
+          $testDir = Join-Path $testRoot '灵媒指南Psychic Guidebooks'
+          New-Item -ItemType Directory -Force -Path $testDir | Out-Null
+          $maker = Join-Path $testRoot 'make_fixture.py'
+          @'
+          from pathlib import Path
+          import sys
+          out = Path(sys.argv[1])
+          stream = b'BT /F1 18 Tf 72 720 Td (Unicode path test) Tj ET\n'
+          objs = [
+              b'<< /Type /Catalog /Pages 2 0 R >>',
+              b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+              b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>',
+              f'<< /Length {len(stream)} >>\nstream\n'.encode('ascii') + stream + b'endstream',
+              b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+          ]
+          data = bytearray(b'%PDF-1.4\n')
+          offsets = [0]
+          for i, obj in enumerate(objs, 1):
+              offsets.append(len(data))
+              data.extend(f'{i} 0 obj\n'.encode('ascii'))
+              data.extend(obj + b'\nendobj\n')
+          xref = len(data)
+          data.extend(f'xref\n0 {len(objs)+1}\n0000000000 65535 f \n'.encode('ascii'))
+          for off in offsets[1:]:
+              data.extend(f'{off:010d} 00000 n \n'.encode('ascii'))
+          data.extend(f'trailer\n<< /Size {len(objs)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n'.encode('ascii'))
+          out.write_bytes(data)
+          '@ | Set-Content -LiteralPath $maker -Encoding utf8
+          $pdf = Join-Path $testDir '直觉之路-input.pdf'
+          & python $maker $pdf
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $pdf)) { throw 'Failed to create Unicode PDF fixture' }
+          $rawExe = Join-Path $env:GITHUB_WORKSPACE 'package\pdf2htmlEX.exe'
+          $oneExe = Join-Path $env:GITHUB_WORKSPACE ("onefile\pdf2htmlEX-{0}-onefile.exe" -f $env:BUILD_ARCH)
+          $rawHtml = '原生版本-转换结果.html'
+          Push-Location $testDir
+          try {
+            Write-Host 'Testing portable executable with Unicode input/output paths...'
+            & $rawExe $pdf $rawHtml
+            if ($LASTEXITCODE -ne 0) { throw "Portable executable failed with exit code $LASTEXITCODE" }
+            if (!(Test-Path -LiteralPath (Join-Path $testDir $rawHtml)) -or (Get-Item -LiteralPath (Join-Path $testDir $rawHtml)).Length -lt 100) { throw 'Portable executable produced no usable HTML output' }
+            $oneHtml = '单文件版本-转换结果.html'
+            Write-Host 'Testing single-file executable with Unicode input/output paths...'
+            & $oneExe $pdf $oneHtml
+            if ($LASTEXITCODE -ne 0) { throw "Single-file executable failed with exit code $LASTEXITCODE" }
+            if (!(Test-Path -LiteralPath (Join-Path $testDir $oneHtml)) -or (Get-Item -LiteralPath (Join-Path $testDir $oneHtml)).Length -lt 100) { throw 'Single-file executable produced no usable HTML output' }
+          } finally { Pop-Location }
 
       - name: Upload diagnostic logs
         if: always()
@@ -365,7 +809,7 @@ jobs:
           path: logs/
           if-no-files-found: warn
 
-      - name: Upload portable Windows build
+      - name: Upload portable Windows build (exe + DLLs + data)
         if: success()
         uses: actions/upload-artifact@v7
         with:
@@ -373,36 +817,56 @@ jobs:
           path: package/
           if-no-files-found: error
 
+      - name: Upload single-file Windows executable
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pdf2htmlEX-windows-${{ matrix.arch }}-onefile
+          path: onefile/pdf2htmlEX-${{ matrix.arch }}-onefile.exe
+          if-no-files-found: error
 
-  combine-portable-builds:
-    name: Combine x86 and x64 portable builds
+
+  combine-builds:
+    name: Combine x86 and x64 downloads
     needs: build-windows
     if: needs.build-windows.result == 'success'
     runs-on: windows-2022
     steps:
-      - name: Download both architecture builds
+      - name: Download portable directory artifacts
         uses: actions/download-artifact@v8
         with:
           pattern: pdf2htmlEX-windows-*-portable
-          path: combined
+          path: combined/portable
           merge-multiple: false
 
-      - name: Verify both architectures are present
-        id: verify
+      - name: Download one-file executables
+        uses: actions/download-artifact@v8
+        with:
+          pattern: pdf2htmlEX-windows-*-onefile
+          path: combined/onefile
+          merge-multiple: false
+
+      - name: Verify x86 and x64 builds are present
         shell: pwsh
         run: |
-          $x64 = Test-Path 'combined/pdf2htmlEX-windows-x64-portable/pdf2htmlEX.exe'
-          $x86 = Test-Path 'combined/pdf2htmlEX-windows-x86-portable/pdf2htmlEX.exe'
-          if ($x64 -and $x86) {
-            'ready=true' >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Error "Missing executable(s): x64=$x64, x86=$x86"
+          $portableX64 = Test-Path 'combined/portable/pdf2htmlEX-windows-x64-portable/pdf2htmlEX.exe'
+          $portableX86 = Test-Path 'combined/portable/pdf2htmlEX-windows-x86-portable/pdf2htmlEX.exe'
+          $oneX64 = Test-Path 'combined/onefile/pdf2htmlEX-windows-x64-onefile/pdf2htmlEX-x64-onefile.exe'
+          $oneX86 = Test-Path 'combined/onefile/pdf2htmlEX-windows-x86-onefile/pdf2htmlEX-x86-onefile.exe'
+          if (!($portableX64 -and $portableX86 -and $oneX64 -and $oneX86)) {
+            Write-Error "Missing outputs: portable x64=$portableX64, portable x86=$portableX86, onefile x64=$oneX64, onefile x86=$oneX86"
           }
 
-      - name: Upload combined x86 and x64 package
-        if: steps.verify.outputs.ready == 'true'
+      - name: Upload combined portable builds
         uses: actions/upload-artifact@v7
         with:
           name: pdf2htmlEX-windows-x86-x64-portable
-          path: combined/
+          path: combined/portable/
+          if-no-files-found: error
+
+      - name: Upload combined single-file executables
+        uses: actions/upload-artifact@v7
+        with:
+          name: pdf2htmlEX-windows-x86-x64-onefile
+          path: combined/onefile/
           if-no-files-found: error
