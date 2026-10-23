@@ -34,18 +34,13 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Install Java for CSS/JavaScript resource minification
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+        uses: actions/checkout@v7
 
       - name: Set up MSYS2 base environment
         uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
+          suppress-deprecation-warnings: msystem-mingw32
           update: true
           install: >-
             base-devel
@@ -163,8 +158,11 @@ jobs:
             command -v cmake
             command -v mingw32-make
             command -v pkgconf
-            command -v java
-            java -version
+            if command -v java >/dev/null 2>&1; then
+              java -version
+            else
+              echo 'Java is optional: this build continues without CSS/JS minification.'
+            fi
             gcc -dumpmachine
             g++ --version | head -n 1
             cmake --version | head -n 1
@@ -764,7 +762,7 @@ jobs:
 
       - name: Upload diagnostic logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pdf2htmlEX-windows-${{ matrix.arch }}-build-logs
           path: logs/
@@ -773,25 +771,25 @@ jobs:
 
       - name: Upload portable directory (diagnostic candidate)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pdf2htmlEX-windows-${{ matrix.arch }}-portable-candidate
           path: package/
-          if-no-files-found: warn
+          if-no-files-found: ignore
           retention-days: 7
 
       - name: Upload single-file executable (diagnostic candidate)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pdf2htmlEX-windows-${{ matrix.arch }}-onefile-candidate
           path: onefile/pdf2htmlEX-${{ matrix.arch }}-onefile.exe
-          if-no-files-found: warn
+          if-no-files-found: ignore
           retention-days: 7
 
       - name: Upload verified portable build
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pdf2htmlEX-windows-${{ matrix.arch }}-portable
           path: package/
@@ -800,7 +798,7 @@ jobs:
 
       - name: Upload verified single-file executable
         if: success()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pdf2htmlEX-windows-${{ matrix.arch }}-onefile
           path: onefile/pdf2htmlEX-${{ matrix.arch }}-onefile.exe
@@ -814,14 +812,14 @@ jobs:
     runs-on: windows-2022
     steps:
       - name: Download portable builds
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: pdf2htmlEX-windows-*-portable
           path: combined/portable
           merge-multiple: false
 
       - name: Download single-file executables
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: pdf2htmlEX-windows-*-onefile
           path: combined/onefile
@@ -842,7 +840,7 @@ jobs:
           Get-ChildItem combined -Recurse -File | Select-Object FullName, Length
 
       - name: Upload combined portable builds
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pdf2htmlEX-windows-x86-x64-portable
           path: combined/portable/
@@ -850,7 +848,7 @@ jobs:
           retention-days: 30
 
       - name: Upload combined single-file executables
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pdf2htmlEX-windows-x86-x64-onefile
           path: combined/onefile/
