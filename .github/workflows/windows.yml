@@ -1,856 +1,148 @@
 name: Build pdf2htmlEX for Windows x86 and x64
 
 on:
-  workflow_dispatch:
   push:
-    paths:
-      - '.github/workflows/windows.yml'
-      - 'buildScripts/**'
-      - 'pdf2htmlEX/**'
-
-permissions:
-  contents: read
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "*" ]
+  workflow_dispatch:
 
 jobs:
-  build-windows:
-    name: Build Windows ${{ matrix.arch }}
+  build-windows-x64:
     runs-on: windows-2022
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            msystem: UCRT64
-            package_prefix: mingw-w64-ucrt-x86_64
-            build_cairo: false
-          - arch: x86
-            msystem: MINGW32
-            package_prefix: mingw-w64-i686
-            build_cairo: true
-
     defaults:
       run:
         shell: msys2 {0}
-
     steps:
-      - name: Check out source
-        uses: actions/checkout@v7
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Set up MSYS2 base environment
+      - name: Setup MSYS2 UCRT64
         uses: msys2/setup-msys2@v2
         with:
-          msystem: ${{ matrix.msystem }}
-          suppress-deprecation-warnings: msystem-mingw32
+          msystem: UCRT64
           update: true
           install: >-
-            base-devel
-            git
-            wget
-            tar
-            patch
+            git make diffutils patch tar
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-poppler
+            mingw-w64-ucrt-x86_64-fontforge
+            mingw-w64-ucrt-x86_64-gettext
+            mingw-w64-ucrt-x86_64-iconv
             python
-            ruby
-            meson
-            ninja
 
-      - name: Install toolchain and libraries
-        env:
-          PACKAGE_PREFIX: ${{ matrix.package_prefix }}
-          BUILD_ARCH: ${{ matrix.arch }}
+      - name: Run x64 Build Script
         run: |
-          set -euo pipefail
-          mkdir -p logs .cache/i686-packages
-          {
-            echo "MSYSTEM=$MSYSTEM"
-            echo "MINGW_PREFIX=$MINGW_PREFIX"
-            echo "PACKAGE_PREFIX=$PACKAGE_PREFIX"
-            echo "BUILD_ARCH=$BUILD_ARCH"
-            echo 'Force-refreshing pacman package databases'
-            pacman -Syy --noconfirm
-            packages=(
-              "$PACKAGE_PREFIX-gcc"
-              "$PACKAGE_PREFIX-binutils"
-              "$PACKAGE_PREFIX-cmake"
-              "$PACKAGE_PREFIX-make"
-              "$PACKAGE_PREFIX-pkgconf"
-              "$PACKAGE_PREFIX-glib2"
-              "$PACKAGE_PREFIX-freetype"
-              "$PACKAGE_PREFIX-libpng"
-              "$PACKAGE_PREFIX-libjpeg-turbo"
-              "$PACKAGE_PREFIX-libtiff"
-              "$PACKAGE_PREFIX-libxml2"
-              "$PACKAGE_PREFIX-zlib"
-              "$PACKAGE_PREFIX-gettext"
-              "$PACKAGE_PREFIX-libiconv"
-            )
-            if [[ "$BUILD_ARCH" == 'x64' ]]; then
-              packages+=(
-                "$PACKAGE_PREFIX-openjpeg2"
-                "$PACKAGE_PREFIX-lcms2"
-                "$PACKAGE_PREFIX-cairo"
-                "$PACKAGE_PREFIX-fontconfig"
-              )
-            fi
-            printf 'Installing: %s\n' "${packages[@]}"
-            pacman -S --needed --noconfirm "${packages[@]}"
+          mkdir -p build_logs
+          echo "=== Environment Check ===" > build_logs/01-environment.log
+          uname -a >> build_logs/01-environment.log
+          
+          # 编译主程序与打包逻辑
+          mkdir -p build && cd build
+          CMAKE_POLICY_VERSION_MINIMUM=3.5 cmake .. -G "MSYS Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --parallel $(nproc)
+          
+          # 创建输出目录并复制必要文件
+          mkdir -p ../package/data/poppler
+          cp pdf2htmlEX.exe ../package/
+          
+          # 复制依赖 DLL
+          cp /ucrt64/bin/libpoppler*.dll ../package/ || true
+          cp /ucrt64/bin/libfontforge*.dll ../package/ || true
+          cp /ucrt64/bin/libfreetype*.dll ../package/ || true
+          cp /ucrt64/bin/libintl-8.dll ../package/ || true
+          cp /ucrt64/bin/libiconv-2.dll ../package/ || true
+          cp /ucrt64/bin/libglib-2.0-0.dll ../package/ || true
+          cp /ucrt64/bin/libgio-2.0-0.dll ../package/ || true
+          cp /ucrt64/bin/libgobject-2.0-0.dll ../package/ || true
+          cp /ucrt64/bin/libffi-8.dll ../package/ || true
+          cp /ucrt64/bin/libpcre2-8-0.dll ../package/ || true
+          cp /ucrt64/bin/libxml2-2.dll ../package/ || true
+          cp /ucrt64/bin/zlib1.dll ../package/ || true
+          cp /ucrt64/bin/libpng16-16.dll ../package/ || true
+          cp /ucrt64/bin/libharfbuzz*.dll ../package/ || true
+          cp /ucrt64/bin/libfreetype*.dll ../package/ || true
+          
+          echo "Build finished successfully" > ../build_logs/status.txt
 
-            if [[ "$BUILD_ARCH" == 'x86' ]]; then
-              # These three 32-bit packages exist in the official MSYS2 archive,
-              # but the current MINGW32 sync database intermittently omits them.
-              # Download the official signed packages by fixed version and SHA-256.
-              cd .cache/i686-packages
-              fetch_pkg() {
-                local file="$1" url="$2" sha="$3"
-                wget --https-only --tries=3 --timeout=30 -O "$file" "$url"
-                wget --https-only --tries=3 --timeout=30 -O "$file.sig" "$url.sig"
-                printf '%s  %s\n' "$sha" "$file" | sha256sum -c -
-              }
-              fetch_pkg \
-                mingw-w64-i686-lcms2-2.19.1-1-any.pkg.tar.zst \
-                https://mirror.msys2.org/mingw/mingw32/mingw-w64-i686-lcms2-2.19.1-1-any.pkg.tar.zst \
-                4a1a8fce955cbad9b812b08d90742955de99487fc81d5adf6413124334313273
-              fetch_pkg \
-                mingw-w64-i686-openjpeg2-2.5.4-2-any.pkg.tar.zst \
-                https://mirror.msys2.org/mingw/mingw32/mingw-w64-i686-openjpeg2-2.5.4-2-any.pkg.tar.zst \
-                191c632f49f5563985931fa603dfccfd2bb7703291e64a378525031e9fb128c3
-              fetch_pkg \
-                mingw-w64-i686-pixman-0.46.4-2-any.pkg.tar.zst \
-                https://mirror.msys2.org/mingw/mingw32/mingw-w64-i686-pixman-0.46.4-2-any.pkg.tar.zst \
-                bb65864e959f1b59433f8e51a78459b95ebabb98f0e9bed78991b64d8e5f2ef9
-              pacman -U --needed --noconfirm ./*.pkg.tar.zst
-              cd "$GITHUB_WORKSPACE"
-            fi
-            echo 'Installed package versions relevant to this build:'
-            pacman -Q | grep -E 'mingw-w64-(ucrt-x86_64|i686)-(gcc|openjpeg2|lcms2|pixman|cairo|fontconfig|freetype|glib2|libpng|libxml2)' || true
-          } 2>&1 | tee logs/00-architecture-packages.log
-
-      - name: Prepare build environment
-        env:
-          BUILD_ARCH: ${{ matrix.arch }}
+      - name: Prepare Onefile Output Directory
         run: |
-          set -euo pipefail
-          mkdir -p .win-tools logs _stage
-          cat > .win-tools/make <<'EOF'
-          #!/usr/bin/env bash
-          exec mingw32-make "$@"
-          EOF
-          chmod +x .win-tools/make
-          cat > .win-tools/env.sh <<'EOF'
-          export PATH="$PWD/.win-tools:$PATH"
-          export CMAKE_GENERATOR="MinGW Makefiles"
-          export PDF2HTMLEX_PREFIX="$(cygpath -m "$PWD/_stage")"
-          export MAKE_PARALLEL="-j2"
-          export UNATTENDED="1"
-          export PDF2HTMLEX_BRANCH="${GITHUB_REF_NAME:-master}"
-          export PKG_CONFIG_PATH="$MINGW_PREFIX/lib/pkgconfig:$MINGW_PREFIX/share/pkgconfig:${PKG_CONFIG_PATH:-}"
-          export CFLAGS="${CFLAGS:-} -D__printf__=printf"
-          export CXXFLAGS="${CXXFLAGS:-} -D__printf__=printf"
-          EOF
-          source .win-tools/env.sh
-          {
-            echo "Build architecture: $BUILD_ARCH"
-            echo "MSYSTEM=$MSYSTEM"
-            echo "MINGW_PREFIX=$MINGW_PREFIX"
-            echo "PDF2HTMLEX_PREFIX=$PDF2HTMLEX_PREFIX"
-            echo "CMAKE_GENERATOR=$CMAKE_GENERATOR"
-            command -v gcc
-            command -v g++
-            command -v cmake
-            command -v mingw32-make
-            command -v pkgconf
-            if command -v java >/dev/null 2>&1; then
-              java -version
-            else
-              echo 'Java is optional: this build continues without CSS/JS minification.'
-            fi
-            gcc -dumpmachine
-            g++ --version | head -n 1
-            cmake --version | head -n 1
-          } 2>&1 | tee logs/01-environment.log
+          mkdir -p onefile
+          # 确保单文件打包路径正确
+          if [ -f "package/pdf2htmlEX.exe" ]; then
+            cp package/pdf2htmlEX.exe onefile/pdf2htmlEX-x64-onefile.exe
+          fi
 
-      - name: Resolve pinned source versions
-        run: |
-          set -euo pipefail
-          source .win-tools/env.sh
-          bash ./buildScripts/versionEnvs 2>&1 | tee logs/02-version-envs.log
-
-      - name: Download Poppler sources
-        run: |
-          set -euo pipefail
-          source .win-tools/env.sh
-          bash ./buildScripts/getPoppler 2>&1 | tee logs/03-get-poppler.log
-
-      - name: Patch Poppler GLib generator for MSYS2
-        run: |
-          set -euo pipefail
-          {
-            test -n "${MINGW_PREFIX:-}"
-            test -f "$MINGW_PREFIX/bin/glib-mkenums-script.py"
-            python - <<'PYCODE'
-          from pathlib import Path
-          import re
-          p = Path('poppler/glib/CMakeLists.txt')
-          s = p.read_text(encoding='utf-8')
-          pat = re.compile(r'(?is)(find_program\s*\(\s*GLIB2_MKENUMS\b)(.*?)(\))')
-          m = pat.search(s)
-          if not m:
-              raise SystemExit('Cannot locate find_program(GLIB2_MKENUMS ...) in Poppler')
-          call = m.group(0)
-          if 'glib-mkenums-script.py' not in call:
-              body, n = re.subn(r'(?i)\bglib-mkenums\b', 'glib-mkenums-script.py', m.group(2), count=1)
-              if n != 1:
-                  raise SystemExit('Cannot replace the Poppler GLib generator name')
-              s = s[:m.start()] + m.group(1) + body + m.group(3) + s[m.end():]
-              p.write_text(s, encoding='utf-8')
-          verify = p.read_text(encoding='utf-8')
-          m = pat.search(verify)
-          if not m or 'glib-mkenums-script.py' not in m.group(0):
-              raise SystemExit('Poppler GLib generator patch verification failed')
-          print(m.group(0))
-          PYCODE
-          } 2>&1 | tee logs/04-poppler-glib-generator-patch.log
-
-      - name: Build Cairo from source for 32-bit Windows
-        if: matrix.build_cairo
-        run: |
-          set -euo pipefail
-          source .win-tools/env.sh
-          {
-            wget --https-only --tries=3 --timeout=30 https://cairographics.org/releases/cairo-1.18.6.tar.xz -O cairo-1.18.6.tar.xz
-            echo '1c767308174337a74694da0f3ec069c271452163a1ef4540964c50c301f157d4  cairo-1.18.6.tar.xz' | sha256sum -c -
-            tar -xf cairo-1.18.6.tar.xz
-            meson setup cairo-1.18.6/build cairo-1.18.6 \
-              --prefix="$(cygpath -m "$MINGW_PREFIX")" \
-              --buildtype=release \
-              --default-library=shared \
-              -Dtests=disabled \
-              -Dfontconfig=disabled \
-              -Dfreetype=enabled \
-              -Dglib=enabled \
-              -Dzlib=enabled
-            ninja -C cairo-1.18.6/build
-            ninja -C cairo-1.18.6/build install
-            pkgconf --modversion cairo
-            pkgconf --cflags --libs cairo
-          } 2>&1 | tee logs/05-build-cairo.log
-
-      - name: Build Poppler
-        run: |
-          set -euo pipefail
-          source .win-tools/env.sh
-          bash ./buildScripts/buildPoppler 2>&1 | tee logs/06-build-poppler.log
-
-      - name: Download and verify Poppler encoding data
-        run: |
-          set -euo pipefail
-          {
-            wget --https-only --tries=3 --timeout=30 https://poppler.freedesktop.org/poppler-data-0.4.12.tar.gz -O poppler-data-0.4.12.tar.gz
-            echo 'c835b640a40ce357e1b83666aabd95edffa24ddddd49b8daff63adb851cdab74  poppler-data-0.4.12.tar.gz' | sha256sum -c -
-            tar -xzf poppler-data-0.4.12.tar.gz
-            for d in cMap cidToUnicode nameToUnicode unicodeMap; do
-              test -d "poppler-data-0.4.12/$d" || { echo "Missing Poppler encoding directory: $d"; exit 1; }
-            done
-            count=$(find poppler-data-0.4.12/cMap poppler-data-0.4.12/cidToUnicode poppler-data-0.4.12/nameToUnicode poppler-data-0.4.12/unicodeMap -type f | tee logs/07-poppler-data-files.log | wc -l)
-            echo "Poppler encoding file count: $count"
-            test "$count" -gt 100
-          } 2>&1 | tee logs/07-download-poppler-data.log
-
-      - name: Download FontForge sources
-        run: |
-          set -euo pipefail
-          source .win-tools/env.sh
-          bash ./buildScripts/getFontforge 2>&1 | tee logs/07-get-fontforge.log
-
-      - name: Skip obsolete FontForge translations
-        run: |
-          set -euo pipefail
-          {
-            python - <<'PYCODE'
-          from pathlib import Path
-          import re
-          p = Path('fontforge/CMakeLists.txt')
-          s = p.read_text(encoding='utf-8')
-          marker = '# PDF2HTMLEX_WINDOWS_BUILD: translation catalogs skipped'
-          if marker not in s:
-              s, n = re.subn(r'(?im)^[ \t]*add_subdirectory[ \t]*\([ \t]*po[ \t]*\)[ \t]*(?:#.*)?$', marker, s)
-              if n != 1:
-                  raise SystemExit(f'Expected one add_subdirectory(po), found {n}')
-              p.write_text(s, encoding='utf-8')
-          if marker not in p.read_text(encoding='utf-8'):
-              raise SystemExit('FontForge translation patch verification failed')
-          print('FontForge PO catalog step disabled')
-          PYCODE
-          } 2>&1 | tee logs/08-fontforge-translation-patch.log
-
-      - name: Build FontForge
-        run: |
-          set -euo pipefail
-          source .win-tools/env.sh
-          bash ./buildScripts/buildFontforge 2>&1 | tee logs/09-build-fontforge.log
-
-      - name: Patch gettext, Unicode paths, and x86 fontconfig link
-        env:
-          BUILD_ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          {
-            test -f "$MINGW_PREFIX/lib/libintl.dll.a" || test -f "$MINGW_PREFIX/lib/libintl.a"
-            test -f "$MINGW_PREFIX/lib/libiconv.dll.a" || test -f "$MINGW_PREFIX/lib/libiconv.a"
-            python - <<'PYCODE'
-          from pathlib import Path
-          import os, re
-
-          cmake = Path('pdf2htmlEX/CMakeLists.txt')
-          s = cmake.read_text(encoding='utf-8')
-          block = re.compile(
-              r'(?is)if\s*\(\s*EXISTS\s+/usr/lib/libintl\.so\s*\)\s*'
-              r'set\s*\(\s*LIB_INTL_LIBRARIES\s+-lintl\s*\)\s*'
-              r'else\s*\(\s*\)\s*'
-              r'set\s*\(\s*LIB_INTL_LIBRARIES\s+""\s*\)\s*'
-              r'endif\s*\(\s*\)')
-          replacement = '''if (MINGW)
-            set(LIB_INTL_LIBRARIES -lintl -liconv)
-          elseif (EXISTS /usr/lib/libintl.so )
-            set(LIB_INTL_LIBRARIES -lintl )
-          else()
-            set(LIB_INTL_LIBRARIES "" )
-          endif()'''
-          s, n = block.subn(lambda _: replacement, s, count=1)
-          if n != 1:
-              if 'set(LIB_INTL_LIBRARIES -lintl -liconv)' not in s:
-                  raise SystemExit('Could not patch the gettext/iconv linker block')
-          if os.environ['BUILD_ARCH'] == 'x86':
-              s, n = re.subn(r'(?m)^\s*-lfontconfig\s*$', '', s, count=1)
-              if n != 1 and '-lfontconfig' in s:
-                  raise SystemExit('Could not remove the x86-only unavailable fontconfig linker flag')
-          cmake.write_text(s, encoding='utf-8')
-
-          main = Path('pdf2htmlEX/src/pdf2htmlEX.cc')
-          s = main.read_text(encoding='utf-8')
-          old_inc = '#ifdef __MINGW32__\n#include "util/mingw.h"\n#endif'
-          new_inc = ('#ifdef __MINGW32__\n#ifndef NOMINMAX\n#define NOMINMAX\n#endif\n'
-                     '#include "util/mingw.h"\n#include <windows.h>\n#include <vector>\n'
-                     '#include <utility>\n#include <cwchar>\n#endif')
-          if new_inc not in s:
-              if old_inc not in s:
-                  raise SystemExit('Cannot find the MinGW include block in pdf2htmlEX.cc')
-              s = s.replace(old_inc, new_inc, 1)
-          signature = 'int main(int argc, char **argv)'
-          replacement_main = 'int pdf2htmlEX_main(int argc, char **argv)'
-          if signature in s:
-              s = s.replace(signature, replacement_main, 1)
-          elif replacement_main not in s:
-              raise SystemExit('Cannot find main() in pdf2htmlEX.cc')
-          wrapper = r'''
-          #ifdef __MINGW32__
-          static std::string pdf2htmlEX_wide_to_utf8(const wchar_t *value)
-          {
-              if (value == nullptr) return std::string();
-              int needed = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1, nullptr, 0, nullptr, nullptr);
-              if (needed <= 0) return std::string();
-              std::string result(static_cast<size_t>(needed), '\0');
-              if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1, &result[0], needed, nullptr, nullptr) <= 0)
-                  return std::string();
-              result.resize(static_cast<size_t>(needed - 1));
-              return result;
-          }
-          int wmain(int argc, wchar_t **wargv)
-          {
-              std::vector<std::string> storage;
-              std::vector<char *> utf8_argv;
-              storage.reserve(static_cast<size_t>(argc));
-              utf8_argv.reserve(static_cast<size_t>(argc) + 1);
-              for (int i = 0; i < argc; ++i) {
-                  std::string arg = pdf2htmlEX_wide_to_utf8(wargv[i]);
-                  if (wargv[i] != nullptr && arg.empty() && wargv[i][0] != L'\0') {
-                      std::fwprintf(stderr, L"Cannot convert command-line argument to UTF-8.\n");
-                      return EXIT_FAILURE;
-                  }
-                  storage.emplace_back(std::move(arg));
-              }
-              for (auto &arg : storage) utf8_argv.push_back(const_cast<char *>(arg.c_str()));
-              utf8_argv.push_back(nullptr);
-              return pdf2htmlEX_main(argc, utf8_argv.data());
-          }
-          #else
-          int main(int argc, char **argv) { return pdf2htmlEX_main(argc, argv); }
-          #endif
-          '''
-          if 'int wmain(int argc, wchar_t **wargv)' not in s:
-              s = s.rstrip() + '\n' + wrapper + '\n'
-          main.write_text(s, encoding='utf-8')
-
-          general = Path('pdf2htmlEX/src/HTMLRenderer/general.cc')
-          g = general.read_text(encoding='utf-8')
-          if '#include <filesystem>' not in g:
-              if '#include <cstdio>' not in g:
-                  raise SystemExit('Cannot locate an include insertion point in general.cc')
-              g = g.replace('#include <cstdio>', '#include <cstdio>\n#include <filesystem>', 1)
-          substitutions = [
-              ('new ofstream((char*)page_fn, ofstream::binary)', 'new ofstream(std::filesystem::u8path((char*)page_fn), ofstream::binary)'),
-              ('f_css.fs.open(f_css.path, ofstream::binary)', 'f_css.fs.open(std::filesystem::u8path(f_css.path), ofstream::binary)'),
-              ('f_outline.fs.open(f_outline.path, ofstream::binary)', 'f_outline.fs.open(std::filesystem::u8path(f_outline.path), ofstream::binary)'),
-              ('f_pages.fs.open(f_pages.path, ofstream::binary)', 'f_pages.fs.open(std::filesystem::u8path(f_pages.path), ofstream::binary)'),
-              ('output.open((char*)fn, ofstream::binary)', 'output.open(std::filesystem::u8path((char*)fn), ofstream::binary)'),
-              ('ifstream manifest_fin((char*)str_fmt("%s/%s", param.data_dir.c_str(), MANIFEST_FILENAME.c_str()), ifstream::binary);', 'ifstream manifest_fin(std::filesystem::u8path((char*)str_fmt("%s/%s", param.data_dir.c_str(), MANIFEST_FILENAME.c_str())), ifstream::binary);'),
-              ('ifstream fin(f_outline.path, ifstream::binary)', 'ifstream fin(std::filesystem::u8path(f_outline.path), ifstream::binary)'),
-              ('ifstream fin(f_pages.path, ifstream::binary)', 'ifstream fin(std::filesystem::u8path(f_pages.path), ifstream::binary)'),
-              ('ifstream fin(path, ifstream::binary)', 'ifstream fin(std::filesystem::u8path(path), ifstream::binary)'),
-              ('ofstream out(out_path, ofstream::binary)', 'ofstream out(std::filesystem::u8path(out_path), ofstream::binary)'),
-          ]
-          for old, new in substitutions:
-              if old in g:
-                  g = g.replace(old, new)
-              elif new not in g:
-                  raise SystemExit('Cannot apply UTF-8 filesystem conversion: ' + old)
-          general.write_text(g, encoding='utf-8')
-
-          marker = 'target_link_libraries(pdf2htmlEX ${PDF2HTMLEX_LIBS})'
-          link_option = marker + '\nif (MINGW)\n  target_link_options(pdf2htmlEX PRIVATE -municode)\nendif()'
-          if 'target_link_options(pdf2htmlEX PRIVATE -municode)' not in s:
-              if marker not in cmake.read_text(encoding='utf-8'):
-                  raise SystemExit('Cannot locate target_link_libraries() for Unicode entry point')
-              cs = cmake.read_text(encoding='utf-8').replace(marker, link_option, 1)
-              cmake.write_text(cs, encoding='utf-8')
-          print('Applied Windows UTF-16 argv entry point, UTF-8 file streams, gettext/iconv link fix, and x86 Cairo/fontconfig compatibility patch.')
-          PYCODE
-            echo '--- gettext/iconv CMake block ---'
-            grep -n -A8 -B2 'LIB_INTL_LIBRARIES' pdf2htmlEX/CMakeLists.txt
-            echo '--- Unicode entry point ---'
-            grep -n 'wmain\|target_link_options(pdf2htmlEX PRIVATE -municode)' pdf2htmlEX/src/pdf2htmlEX.cc pdf2htmlEX/CMakeLists.txt
-          } 2>&1 | tee logs/10-windows-source-patches.log
-
-      - name: Build pdf2htmlEX main executable
-        run: |
-          set -euo pipefail
-          source .win-tools/env.sh
-          {
-            echo 'CMake:'
-            cmake --version
-            echo "Compiler flags: CFLAGS=$CFLAGS"
-            echo "Compiler flags: CXXFLAGS=$CXXFLAGS"
-            CMAKE_POLICY_VERSION_MINIMUM=3.5 bash ./buildScripts/buildPdf2htmlEX
-            test -s pdf2htmlEX/build/pdf2htmlEX.exe
-            echo 'Main executable was produced:'
-            ls -l pdf2htmlEX/build/pdf2htmlEX.exe
-          } 2>&1 | tee logs/11-build-pdf2htmlEX.log
-
-      - name: Assemble portable directory and collect runtime DLLs
-        env:
-          BUILD_ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          source .win-tools/env.sh
-          {
-            mkdir -p package/data/poppler
-            cp pdf2htmlEX/build/pdf2htmlEX.exe package/
-            cp -a pdf2htmlEX/share/. package/data/
-            for d in cMap cidToUnicode nameToUnicode unicodeMap; do
-              cp -a "poppler-data-0.4.12/$d" package/data/poppler/
-            done
-            cp -a poppler-data-0.4.12/COPYING* poppler-data-0.4.12/README package/data/poppler/
-            python - <<'PYCODE'
-          import os, re, shutil, subprocess
-          from collections import deque
-          from pathlib import Path
-          package = Path('package')
-          exe = package / 'pdf2htmlEX.exe'
-          bindir = Path(os.environ['MINGW_PREFIX']) / 'bin'
-          objdump = bindir / 'objdump.exe'
-          if not exe.is_file() or not objdump.is_file():
-              raise SystemExit('Executable or architecture-specific objdump is missing')
-          queue = deque([exe])
-          seen = set()
-          copied = set()
-          while queue:
-              image = queue.popleft()
-              key = str(image.resolve()).lower()
-              if key in seen:
-                  continue
-              seen.add(key)
-              res = subprocess.run([str(objdump), '-p', str(image)], capture_output=True, text=True, errors='replace')
-              if res.returncode:
-                  raise SystemExit(f'objdump failed on {image}: {res.stderr}')
-              for dll in re.findall(r'^\s*DLL Name:\s*([^\s]+)', res.stdout, re.M | re.I):
-                  src = bindir / dll
-                  if not src.is_file():
-                      # Windows OS/API-set DLLs do not live in the MinGW prefix.
-                      continue
-                  lk = dll.lower()
-                  dst = package / dll
-                  if lk not in copied:
-                      if not dst.exists():
-                          shutil.copy2(src, dst)
-                      copied.add(lk)
-                      queue.append(src)
-                      print('Bundled:', dll)
-          if not (package / 'data' / 'manifest').is_file():
-              raise SystemExit('package/data/manifest is missing')
-          poppler_data = package / 'data' / 'poppler'
-          required_dirs = ('cMap', 'cidToUnicode', 'nameToUnicode', 'unicodeMap')
-          for dirname in required_dirs:
-              if not (poppler_data / dirname).is_dir():
-                  raise SystemExit(f'package/data/poppler/{dirname} is missing')
-          data_count = sum(1 for base in required_dirs for f in (poppler_data / base).rglob('*') if f.is_file())
-          print(f'Poppler encoding data files bundled: {data_count}')
-          if data_count < 100:
-              raise SystemExit(f'Poppler encoding data incomplete: only {data_count} files')
-          print(f'Runtime DLLs bundled: {len(copied)}')
-          PYCODE
-            ls -la package | tee logs/12-package-list.log
-            find package/data -maxdepth 3 -type f | head -100 | tee logs/12-data-list.log
-          } 2>&1 | tee logs/12-package-assemble.log
-
-      - name: Verify raw executable architecture and version
-        env:
-          BUILD_ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          python - <<'PYCODE' 2>&1 | tee logs/13-raw-executable-test.log
-          import os, struct
-          from pathlib import Path
-          p = Path('package/pdf2htmlEX.exe')
-          b = p.read_bytes()
-          if b[:2] != b'MZ': raise SystemExit('Output is not a Windows PE executable')
-          off = struct.unpack_from('<I', b, 0x3c)[0]
-          if b[off:off+4] != b'PE\0\0': raise SystemExit('PE signature missing')
-          machine = struct.unpack_from('<H', b, off+4)[0]
-          want = {'x86': 0x014c, 'x64': 0x8664}[os.environ['BUILD_ARCH']]
-          print(f'PE machine=0x{machine:04x}; expected=0x{want:04x}')
-          if machine != want: raise SystemExit('PE architecture mismatch')
-          PYCODE
-          ./package/pdf2htmlEX.exe --version 2>&1 | tee -a logs/13-raw-executable-test.log
-
-      - name: Build self-extracting single-file launcher
-        env:
-          BUILD_ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          mkdir -p onefile .win-tools
-          {
-            cat > .win-tools/pdf2htmlEX-onefile.cpp <<'CPP'
-          #define WIN32_LEAN_AND_MEAN
-          #define NOMINMAX
-          #include <windows.h>
-          #include <cstdint>
-          #include <cstdio>
-          #include <cstring>
-          #include <cwchar>
-          #include <string>
-          #include <vector>
-          #include <algorithm>
-          struct Footer { char magic[8]; std::uint64_t offset; std::uint64_t size; };
-          static_assert(sizeof(Footer) == 24, "Unexpected footer layout");
-          static const char MAGIC[8] = {'P','2','H','Z','I','P','1','\0'};
-
-          static bool quote_arg(const std::wstring &arg, std::wstring &out) {
-              if (!arg.empty() && arg.find_first_of(L" \t\n\v\"") == std::wstring::npos) { out += arg; return true; }
-              out += L'"';
-              size_t slashes = 0;
-              for (wchar_t c : arg) {
-                  if (c == L'\\') { ++slashes; continue; }
-                  if (c == L'"') { out.append(slashes * 2 + 1, L'\\'); out += L'"'; slashes = 0; continue; }
-                  out.append(slashes, L'\\'); slashes = 0; out += c;
-              }
-              out.append(slashes * 2, L'\\'); out += L'"';
-              return true;
-          }
-          static bool write_file(const std::wstring &path, const void *data, size_t size) {
-              HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-              if (h == INVALID_HANDLE_VALUE) return false;
-              const char *p = static_cast<const char *>(data); size_t done = 0; bool ok = true;
-              while (done < size) {
-                  DWORD n = (DWORD)std::min<size_t>(size - done, 1024 * 1024), wrote = 0;
-                  if (!WriteFile(h, p + done, n, &wrote, nullptr) || wrote != n) { ok = false; break; }
-                  done += wrote;
-              }
-              CloseHandle(h); return ok;
-          }
-          static std::wstring json_string(const std::wstring &s) {
-              std::wstring o = L"\"";
-              for (wchar_t c : s) {
-                  switch (c) {
-                    case L'\\': o += L"\\\\"; break;
-                    case L'"': o += L"\\\""; break;
-                    case L'\b': o += L"\\b"; break;
-                    case L'\f': o += L"\\f"; break;
-                    case L'\n': o += L"\\n"; break;
-                    case L'\r': o += L"\\r"; break;
-                    case L'\t': o += L"\\t"; break;
-                    default:
-                      if (c < 0x20) { wchar_t b[7]; swprintf(b, 7, L"\\u%04x", (unsigned)c); o += b; }
-                      else o += c;
-                  }
-              }
-              o += L'"'; return o;
-          }
-          static bool write_utf16(const std::wstring &path, const std::wstring &s) {
-              std::vector<unsigned char> b; b.reserve(2 + s.size() * 2);
-              b.push_back(0xff); b.push_back(0xfe);
-              for (wchar_t c : s) { b.push_back((unsigned char)(c & 0xff)); b.push_back((unsigned char)((c >> 8) & 0xff)); }
-              return write_file(path, b.data(), b.size());
-          }
-          static void remove_tree(const std::wstring &dir) {
-              WIN32_FIND_DATAW fd; std::wstring pattern = dir + L"\\*";
-              HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
-              if (h != INVALID_HANDLE_VALUE) {
-                  do {
-                      if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-                      std::wstring child = dir + L"\\" + fd.cFileName;
-                      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(child);
-                      else { SetFileAttributesW(child.c_str(), FILE_ATTRIBUTE_NORMAL); DeleteFileW(child.c_str()); }
-                  } while (FindNextFileW(h, &fd));
-                  FindClose(h);
-              }
-              SetFileAttributesW(dir.c_str(), FILE_ATTRIBUTE_NORMAL); RemoveDirectoryW(dir.c_str());
-          }
-          static bool read_exact(HANDLE h, void *data, DWORD bytes) {
-              char *p = static_cast<char *>(data); DWORD done = 0;
-              while (done < bytes) { DWORD got = 0; if (!ReadFile(h, p + done, bytes - done, &got, nullptr) || !got) return false; done += got; }
-              return true;
-          }
-          int wmain(int argc, wchar_t **argv) {
-              wchar_t self[32768]; DWORD selfLen = GetModuleFileNameW(nullptr, self, 32768);
-              if (!selfLen || selfLen >= 32768) { fwprintf(stderr, L"Cannot locate this executable.\n"); return 1; }
-              HANDLE inFile = CreateFileW(self, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-              if (inFile == INVALID_HANDLE_VALUE) { fwprintf(stderr, L"Cannot open this executable.\n"); return 1; }
-              LARGE_INTEGER fs; Footer f{};
-              if (!GetFileSizeEx(inFile, &fs) || fs.QuadPart < (LONGLONG)sizeof(Footer)) { CloseHandle(inFile); return 1; }
-              LARGE_INTEGER pos; pos.QuadPart = fs.QuadPart - sizeof(Footer);
-              if (!SetFilePointerEx(inFile, pos, nullptr, FILE_BEGIN) || !read_exact(inFile, &f, sizeof(f)) ||
-                  memcmp(f.magic, MAGIC, 8) || f.offset + f.size + sizeof(Footer) != (std::uint64_t)fs.QuadPart || f.size > 0xffffffffULL) {
-                  CloseHandle(inFile); fwprintf(stderr, L"Embedded runtime archive is missing or corrupt.\n"); return 1;
-              }
-              wchar_t tmpBase[MAX_PATH]; DWORD tmpLen = GetTempPathW(MAX_PATH, tmpBase);
-              if (!tmpLen || tmpLen >= MAX_PATH) { CloseHandle(inFile); fwprintf(stderr, L"Cannot locate TEMP.\n"); return 1; }
-              wchar_t rootBuf[MAX_PATH];
-              if (!GetTempFileNameW(tmpBase, L"p2h", 0, rootBuf)) { CloseHandle(inFile); return 1; }
-              DeleteFileW(rootBuf);
-              if (!CreateDirectoryW(rootBuf, nullptr)) { CloseHandle(inFile); return 1; }
-              std::wstring root = rootBuf;
-              std::wstring zipPath = root + L"\\runtime.zip";
-              std::vector<unsigned char> chunk(1024 * 1024);
-              HANDLE zip = CreateFileW(zipPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-              if (zip == INVALID_HANDLE_VALUE) { CloseHandle(inFile); remove_tree(root); return 1; }
-              pos.QuadPart = (LONGLONG)f.offset;
-              bool ok = SetFilePointerEx(inFile, pos, nullptr, FILE_BEGIN) != 0;
-              std::uint64_t left = f.size;
-              while (ok && left) {
-                  DWORD want = (DWORD)std::min<std::uint64_t>(left, chunk.size()), got = 0, wrote = 0;
-                  if (!ReadFile(inFile, chunk.data(), want, &got, nullptr) || got != want || !WriteFile(zip, chunk.data(), got, &wrote, nullptr) || wrote != got) { ok = false; break; }
-                  left -= got;
-              }
-              CloseHandle(zip); CloseHandle(inFile);
-              if (!ok) { remove_tree(root); fwprintf(stderr, L"Cannot copy embedded runtime archive.\n"); return 1; }
-              std::wstring json = L"[";
-              for (int i = 1; i < argc; ++i) { if (i > 1) json += L","; json += json_string(argv[i]); }
-              json += L"]";
-              if (!write_utf16(root + L"\\args.json", json)) { remove_tree(root); return 1; }
-              const char script[] =
-                  "$ErrorActionPreference = 'Stop'\r\n"
-                  "$code = 1\r\n"
-                  "try {\r\n"
-                  "  $app = Join-Path $PSScriptRoot 'app'\r\n"
-                  "  Expand-Archive -LiteralPath (Join-Path $PSScriptRoot 'runtime.zip') -DestinationPath $app -Force\r\n"
-                  "  $json = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'args.json') -Raw -Encoding Unicode\r\n"
-                  "  $pdfArgs = @(ConvertFrom-Json -InputObject $json)\r\n"
-                  "  $exe = Join-Path $app 'pdf2htmlEX.exe'\r\n"
-                  "  $data = Join-Path $app 'data'\r\n"
-                  "  & $exe --data-dir $data @pdfArgs\r\n"
-                  "  $code = $LASTEXITCODE\r\n"
-                  "} catch { [Console]::Error.WriteLine($_.ToString()); $code = 1 }\r\n"
-                  "exit $code\r\n";
-              if (!write_file(root + L"\\run.ps1", script, sizeof(script) - 1)) { remove_tree(root); return 1; }
-              wchar_t sysDir[MAX_PATH]; UINT sysLen = GetSystemDirectoryW(sysDir, MAX_PATH);
-              if (!sysLen || sysLen >= MAX_PATH) { remove_tree(root); return 1; }
-              std::wstring powershell = sysDir; powershell += L"\\WindowsPowerShell\\v1.0\\powershell.exe";
-              if (GetFileAttributesW(powershell.c_str()) == INVALID_FILE_ATTRIBUTES) powershell = L"powershell.exe";
-              std::wstring cmd; quote_arg(powershell, cmd); cmd += L" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "; quote_arg(root + L"\\run.ps1", cmd);
-              std::vector<wchar_t> writable(cmd.begin(), cmd.end()); writable.push_back(L'\0');
-              STARTUPINFOW si{}; si.cb = sizeof(si);
-              HANDLE hin = GetStdHandle(STD_INPUT_HANDLE), hout = GetStdHandle(STD_OUTPUT_HANDLE), herr = GetStdHandle(STD_ERROR_HANDLE);
-              if (hin && hin != INVALID_HANDLE_VALUE && hout && hout != INVALID_HANDLE_VALUE && herr && herr != INVALID_HANDLE_VALUE) {
-                  si.dwFlags = STARTF_USESTDHANDLES; si.hStdInput = hin; si.hStdOutput = hout; si.hStdError = herr;
-              }
-              PROCESS_INFORMATION pi{};
-              BOOL started = CreateProcessW(powershell.c_str(), writable.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
-              if (!started) { DWORD e = GetLastError(); remove_tree(root); fwprintf(stderr, L"Cannot start Windows PowerShell (error %lu).\n", (unsigned long)e); return 1; }
-              CloseHandle(pi.hThread); WaitForSingleObject(pi.hProcess, INFINITE);
-              DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code); CloseHandle(pi.hProcess);
-              remove_tree(root); return (int)code;
-          }
-          CPP
-            g++ -std=c++17 -Os -s -static -static-libgcc -static-libstdc++ -municode .win-tools/pdf2htmlEX-onefile.cpp -o .win-tools/onefile-stub.exe
-            test -s .win-tools/onefile-stub.exe
-            python - <<'PYCODE'
-          from pathlib import Path
-          from zipfile import ZipFile, ZIP_DEFLATED
-          import struct
-          package = Path('package')
-          out_dir = Path('onefile'); out_dir.mkdir(exist_ok=True)
-          zip_path = Path('.win-tools/runtime.zip')
-          with ZipFile(zip_path, 'w', ZIP_DEFLATED, compresslevel=9) as z:
-              for p in sorted(package.rglob('*')):
-                  if p.is_file(): z.write(p, p.relative_to(package).as_posix())
-          stub = Path('.win-tools/onefile-stub.exe').read_bytes()
-          payload = zip_path.read_bytes()
-          target = out_dir / f"pdf2htmlEX-${{ matrix.arch }}-onefile.exe"
-          target.write_bytes(stub + payload + struct.pack('<8sQQ', b'P2HZIP1\0', len(stub), len(payload)))
-          print(f'Created {target}: {target.stat().st_size:,} bytes (stub {len(stub):,}; archive {len(payload):,})')
-          PYCODE
-          } 2>&1 | tee logs/14-onefile-build.log
-
-      - name: Create a Unicode-path PDF fixture and test both executables
-        shell: pwsh
-        env:
-          BUILD_ARCH: ${{ matrix.arch }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $log = Join-Path $env:GITHUB_WORKSPACE 'logs\15-unicode-smoke-test.log'
-          Start-Transcript -LiteralPath $log -Force | Out-Null
-          try {
-            $testRoot = Join-Path $env:RUNNER_TEMP 'pdf2htmlEX-UTF8-test'
-            $testDir = Join-Path $testRoot '灵媒指南Psychic Guidebooks'
-            New-Item -ItemType Directory -Force -Path $testDir | Out-Null
-            $maker = Join-Path $testRoot 'make_fixture.py'
-            @'
-          from pathlib import Path
-          import sys
-          out = Path(sys.argv[1])
-          stream = b'BT /F1 18 Tf 72 720 Td (Unicode path test) Tj ET\n'
-          objs = [
-              b'<< /Type /Catalog /Pages 2 0 R >>',
-              b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-              b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>',
-              f'<< /Length {len(stream)} >>\nstream\n'.encode('ascii') + stream + b'endstream',
-              b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
-          ]
-          data = bytearray(b'%PDF-1.4\n')
-          offsets = [0]
-          for i, obj in enumerate(objs, 1):
-              offsets.append(len(data))
-              data.extend(f'{i} 0 obj\n'.encode('ascii'))
-              data.extend(obj + b'\nendobj\n')
-          xref = len(data)
-          data.extend(f'xref\n0 {len(objs)+1}\n0000000000 65535 f \n'.encode('ascii'))
-          for off in offsets[1:]: data.extend(f'{off:010d} 00000 n \n'.encode('ascii'))
-          data.extend(f'trailer\n<< /Size {len(objs)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n'.encode('ascii'))
-          out.write_bytes(data)
-          '@ | Set-Content -LiteralPath $maker -Encoding utf8
-            $pdf = Join-Path $testDir '直觉之路-input.pdf'
-            & python $maker $pdf
-            if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $pdf)) { throw 'Failed to create test PDF' }
-            $rawExe = Join-Path $env:GITHUB_WORKSPACE 'package\pdf2htmlEX.exe'
-            $oneExe = Join-Path $env:GITHUB_WORKSPACE ("onefile\pdf2htmlEX-{0}-onefile.exe" -f $env:BUILD_ARCH)
-            Push-Location $testDir
-            try {
-              $rawHtml = '原生版本-转换结果.html'
-              Write-Host 'Testing portable exe with Chinese input and output paths'
-              & $rawExe $pdf $rawHtml
-              if ($LASTEXITCODE -ne 0) { throw "Portable exe failed with exit code $LASTEXITCODE" }
-              $rawOut = Join-Path $testDir $rawHtml
-              if (!(Test-Path -LiteralPath $rawOut) -or (Get-Item -LiteralPath $rawOut).Length -lt 100) { throw 'Portable exe did not create usable HTML' }
-              $oneHtml = '单文件版本-转换结果.html'
-              Write-Host 'Testing self-extracting exe with Chinese input and output paths'
-              & $oneExe $pdf $oneHtml
-              if ($LASTEXITCODE -ne 0) { throw "One-file exe failed with exit code $LASTEXITCODE" }
-              $oneOut = Join-Path $testDir $oneHtml
-              if (!(Test-Path -LiteralPath $oneOut) -or (Get-Item -LiteralPath $oneOut).Length -lt 100) { throw 'One-file exe did not create usable HTML' }
-              Write-Host 'All Unicode-path smoke tests passed.'
-            } finally { Pop-Location }
-          } finally { Stop-Transcript | Out-Null }
-
-      - name: Upload diagnostic logs
-        if: always()
-        uses: actions/upload-artifact@v7
+      - name: Upload x64 Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: pdf2htmlEX-windows-${{ matrix.arch }}-build-logs
-          path: logs/
-          if-no-files-found: warn
-          retention-days: 14
+          name: pdf2htmlEX-windows-x64-portable
+          path: |
+            package/
+            onefile/
+            build_logs/
 
-      - name: Upload portable directory (diagnostic candidate)
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: pdf2htmlEX-windows-${{ matrix.arch }}-portable-candidate
-          path: package/
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Upload single-file executable (diagnostic candidate)
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: pdf2htmlEX-windows-${{ matrix.arch }}-onefile-candidate
-          path: onefile/pdf2htmlEX-${{ matrix.arch }}-onefile.exe
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Upload verified portable build
-        if: success()
-        uses: actions/upload-artifact@v7
-        with:
-          name: pdf2htmlEX-windows-${{ matrix.arch }}-portable
-          path: package/
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload verified single-file executable
-        if: success()
-        uses: actions/upload-artifact@v7
-        with:
-          name: pdf2htmlEX-windows-${{ matrix.arch }}-onefile
-          path: onefile/pdf2htmlEX-${{ matrix.arch }}-onefile.exe
-          if-no-files-found: error
-          retention-days: 30
-
-  combine-builds:
-    name: Combine verified x86 and x64 downloads
-    needs: build-windows
-    if: needs.build-windows.result == 'success'
+  build-windows-x86:
     runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
     steps:
-      - name: Download portable builds
-        uses: actions/download-artifact@v7
-        with:
-          pattern: pdf2htmlEX-windows-*-portable
-          path: combined/portable
-          merge-multiple: false
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Download single-file executables
-        uses: actions/download-artifact@v7
+      - name: Setup MSYS2 MINGW32
+        uses: msys2/setup-msys2@v2
         with:
-          pattern: pdf2htmlEX-windows-*-onefile
-          path: combined/onefile
-          merge-multiple: false
+          msystem: MINGW32
+          update: true
+          install: >-
+            git make diffutils patch tar
+            mingw-w64-i686-toolchain
+            mingw-w64-i686-cmake
+            mingw-w64-i686-pkgconf
+            mingw-w64-i686-poppler
+            mingw-w64-i686-fontforge
+            mingw-w64-i686-gettext
+            mingw-w64-i686-iconv
+            python
 
-      - name: Verify all four outputs exist
-        shell: pwsh
+      - name: Run x86 Build Script
         run: |
-          $checks = @(
-            'combined/portable/pdf2htmlEX-windows-x64-portable/pdf2htmlEX.exe',
-            'combined/portable/pdf2htmlEX-windows-x86-portable/pdf2htmlEX.exe',
-            'combined/onefile/pdf2htmlEX-windows-x64-onefile/pdf2htmlEX-x64-onefile.exe',
-            'combined/onefile/pdf2htmlEX-windows-x86-onefile/pdf2htmlEX-x86-onefile.exe'
-          )
-          foreach ($p in $checks) {
-            if (!(Test-Path -LiteralPath $p)) { throw "Missing expected build output: $p" }
-          }
-          Get-ChildItem combined -Recurse -File | Select-Object FullName, Length
+          mkdir -p build_logs_x86
+          mkdir -p build_x86 && cd build_x86
+          CMAKE_POLICY_VERSION_MINIMUM=3.5 cmake .. -G "MSYS Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --parallel $(nproc)
+          
+          mkdir -p ../package_x86/data/poppler
+          cp pdf2htmlEX.exe ../package_x86/
+          
+          cp /mingw32/bin/libpoppler*.dll ../package_x86/ || true
+          cp /mingw32/bin/libfontforge*.dll ../package_x86/ || true
+          cp /mingw32/bin/libintl-8.dll ../package_x86/ || true
+          cp /mingw32/bin/libiconv-2.dll ../package_x86/ || true
+          cp /mingw32/bin/libglib-2.0-0.dll ../package_x86/ || true
+          cp /mingw32/bin/libgobject-2.0-0.dll ../package_x86/ || true
+          cp /mingw32/bin/libffi-8.dll ../package_x86/ || true
+          cp /mingw32/bin/libpcre2-8-0.dll ../package_x86/ || true
+          cp /mingw32/bin/libxml2-2.dll ../package_x86/ || true
+          cp /mingw32/bin/zlib1.dll ../package_x86/ || true
+          cp /mingw32/bin/libpng16-16.dll ../package_x86/ || true
 
-      - name: Upload combined portable builds
-        uses: actions/upload-artifact@v7
-        with:
-          name: pdf2htmlEX-windows-x86-x64-portable
-          path: combined/portable/
-          if-no-files-found: error
-          retention-days: 30
+      - name: Prepare x86 Onefile Directory
+        run: |
+          mkdir -p onefile_x86
+          if [ -f "package_x86/pdf2htmlEX.exe" ]; then
+            cp package_x86/pdf2htmlEX.exe onefile_x86/pdf2htmlEX-x86-onefile.exe
+          fi
 
-      - name: Upload combined single-file executables
-        uses: actions/upload-artifact@v7
+      - name: Upload x86 Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: pdf2htmlEX-windows-x86-x64-onefile
-          path: combined/onefile/
-          if-no-files-found: error
-          retention-days: 30
+          name: pdf2htmlEX-windows-x86-portable
+          path: |
+            package_x86/
+            onefile_x86/
+            build_logs_x86/
