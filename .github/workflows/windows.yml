@@ -1,4 +1,4 @@
-name: Build pdf2htmlEX for Windows x86 and x64
+name: Build pdf2htmlEX for Windows x86 and x64 (v14)
 
 on:
   workflow_dispatch:
@@ -673,6 +673,53 @@ jobs:
           objdump = bindir / 'objdump.exe'
           if not exe.is_file() or not objdump.is_file():
               raise SystemExit('Executable or architecture-specific objdump is missing')
+
+          # Validate the manifest before running pdf2htmlEX. The source manifest
+          # references compatibility.min.js, but this checkout does not ship that
+          # optional IE9-era PDF.js shim. Modern browsers do not need it. If neither
+          # legacy-shim filename exists, comment only that optional directive out;
+          # any other missing manifest resource is a hard packaging error.
+          manifest_path = package / 'data' / 'manifest'
+          if not manifest_path.is_file():
+              raise SystemExit('package/data/manifest is missing')
+          manifest_lines = manifest_path.read_text(encoding='utf-8').splitlines()
+          manifest_changed = False
+          for index, line in enumerate(manifest_lines):
+              match = re.match(r'^(\s*)@([^\s#]+)\s*$', line)
+              if not match:
+                  continue
+              resource_name = match.group(2)
+              resource_path = manifest_path.parent / resource_name
+              if resource_path.is_file():
+                  continue
+              if resource_name.lower() in ('compatibility.min.js', 'compatibility.js'):
+                  alternate_name = ('compatibility.js' if resource_name.lower() == 'compatibility.min.js'
+                                    else 'compatibility.min.js')
+                  alternate_path = manifest_path.parent / alternate_name
+                  if alternate_path.is_file():
+                      manifest_lines[index] = f'{match.group(1)}@{alternate_name}'
+                      print(f'Manifest compatibility fallback: {resource_name} -> {alternate_name}')
+                  else:
+                      manifest_lines[index] = (
+                          f'{match.group(1)}# Optional legacy-browser compatibility shim omitted: @{resource_name}'
+                      )
+                      print(f'Omitted optional legacy-browser shim missing from source: {resource_name}')
+                  manifest_changed = True
+                  continue
+              raise SystemExit(
+                  f'Manifest resource missing at line {index + 1}: {resource_name} '
+                  f'(expected {resource_path})'
+              )
+          if manifest_changed:
+              manifest_path.write_text('\n'.join(manifest_lines) + '\n', encoding='utf-8', newline='\n')
+
+          # Verify every active @resource directive now exists; fail here with a
+          # useful message rather than later during PDF-to-HTML conversion.
+          for index, line in enumerate(manifest_path.read_text(encoding='utf-8').splitlines(), 1):
+              match = re.match(r'^\s*@([^\s#]+)\s*$', line)
+              if match and not (manifest_path.parent / match.group(1)).is_file():
+                  raise SystemExit(f'Unresolved manifest resource at line {index}: {match.group(1)}')
+
           queue = deque([exe])
           seen = set()
           copied = set()
@@ -698,8 +745,6 @@ jobs:
                       copied.add(lk)
                       queue.append(src)
                       print('Bundled:', dll)
-          if not (package / 'data' / 'manifest').is_file():
-              raise SystemExit('package/data/manifest is missing')
           poppler_data = package / 'data' / 'poppler'
           required_dirs = ('cMap', 'cidToUnicode', 'nameToUnicode', 'unicodeMap')
           for dirname in required_dirs:
