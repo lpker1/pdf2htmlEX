@@ -456,7 +456,101 @@ jobs:
           '''
           if 'int wmain(int argc, wchar_t **wargv)' not in s:
               s = s.rstrip() + '\n' + wrapper + '\n'
+
+          # A Windows absolute output argument must not be joined as ./C:\\... .
+          # Normalize it into dest_dir + basename before HTMLRenderer joins paths.
+          output_marker = '    check_param();'
+          output_fix = r'''    check_param();
+          #ifdef __MINGW32__
+              // PDF2HTMLEX_WINDOWS_ABSOLUTE_OUTPUT_FIX: absolute Windows output path.
+              {
+                  const std::string output_path = param.output_filename;
+                  const bool drive_absolute = output_path.size() >= 3 &&
+            output_path[1] == ':' && (output_path[2] == '\\' || output_path[2] == '/');
+                  const bool unc_absolute = output_path.size() >= 2 &&
+            ((output_path[0] == '\\' && output_path[1] == '\\') ||
+             (output_path[0] == '/' && output_path[1] == '/'));
+                  if (drive_absolute || unc_absolute) {
+            const std::size_t separator = output_path.find_last_of("/\\\\");
+            if (separator == std::string::npos || separator + 1 >= output_path.size()) {
+                std::cerr << "Invalid absolute output path: " << output_path << std::endl;
+                return EXIT_FAILURE;
+            }
+            param.dest_dir = output_path.substr(0, separator);
+            param.output_filename = output_path.substr(separator + 1);
+                  }
+              }
+          #endif'''
+          if 'PDF2HTMLEX_WINDOWS_ABSOLUTE_OUTPUT_FIX' not in s:
+              if output_marker not in s:
+                  raise SystemExit('Cannot locate check_param() for Windows absolute output-path fix')
+              s = s.replace(output_marker, output_fix, 1)
           main.write_text(s, encoding='utf-8')
+
+          # Make basename parsing recognize Windows backslash separators.
+          path_cc = Path('pdf2htmlEX/src/util/path.cc')
+          pc = path_cc.read_text(encoding='utf-8')
+          old_filename = '''string get_filename (const string & path)
+          {
+              size_t idx = path.rfind('/');
+              if(idx == string::npos)
+                  return path;
+              else if (idx == path.size() - 1)
+                  return "";
+              return path.substr(idx + 1);
+          }'''
+          new_filename = '''string get_filename (const string & path)
+          {
+              size_t idx = path.find_last_of("/\\\\");
+              if(idx == string::npos)
+                  return path;
+              else if (idx == path.size() - 1)
+                  return "";
+              return path.substr(idx + 1);
+          }'''
+          if 'path.find_last_of("/\\\\")' not in pc:
+              if old_filename not in pc:
+                  raise SystemExit('Cannot locate get_filename() for Windows path-separator fix')
+              pc = pc.replace(old_filename, new_filename, 1)
+
+          # Windows directory creation must use wide Win32 paths for UTF-8 paths.
+          if '#include <filesystem>' not in pc:
+              pc = pc.replace('#include <cstring>', '#include <cstring>\n#include <filesystem>', 1)
+          create_block = re.compile(r'(?s)void create_directories\(const string & path\)\s*\{.*?\n\}')
+          new_create_block = r'''void create_directories(const string & path)
+          {
+              if(path.empty()) return;
+          #ifdef __MINGW32__
+              std::error_code ec;
+              const auto native_path = std::filesystem::u8path(path);
+              if (std::filesystem::exists(native_path, ec)) {
+                  if (!ec && std::filesystem::is_directory(native_path, ec)) return;
+                  throw string("Cannot create directory: ") + path;
+              }
+              ec.clear();
+              std::filesystem::create_directories(native_path, ec);
+              if (!ec && std::filesystem::is_directory(native_path, ec)) return;
+              throw string("Cannot create directory: ") + path;
+          #else
+              size_t idx = path.rfind('/');
+              if(idx != string::npos) {
+                  create_directories(path.substr(0, idx));
+              }
+              int r = mkdir(path.c_str(), S_IRWXU);
+              if(r != 0) {
+                  if(errno == EEXIST) {
+                      struct stat stat_buf;
+                      if((stat(path.c_str(), &stat_buf) == 0) && S_ISDIR(stat_buf.st_mode)) return;
+                  }
+                  throw string("Cannot create directory: ") + path;
+              }
+          #endif
+          }'''
+          if 'std::filesystem::create_directories(native_path, ec)' not in pc:
+              pc, n = create_block.subn(new_create_block, pc, count=1)
+              if n != 1:
+                  raise SystemExit('Cannot locate create_directories() for Windows Unicode-path fix')
+          path_cc.write_text(pc, encoding='utf-8')
 
           general = Path('pdf2htmlEX/src/HTMLRenderer/general.cc')
           g = general.read_text(encoding='utf-8')
@@ -490,12 +584,17 @@ jobs:
                   raise SystemExit('Cannot locate target_link_libraries() for Unicode entry point')
               cs = cmake.read_text(encoding='utf-8').replace(marker, link_option, 1)
               cmake.write_text(cs, encoding='utf-8')
-          print('Applied Windows UTF-16 argv entry point, UTF-8 file streams, gettext/iconv link fix, and x86 Cairo/fontconfig compatibility patch.')
+          print('Applied Windows UTF-16 argv, UTF-8 input/output streams, absolute output-path normalization, Windows basename and Unicode directory handling, gettext/iconv link fix, and x86 compatibility patches.')
           PYCODE
             echo '--- gettext/iconv CMake block ---'
             grep -n -A8 -B2 'LIB_INTL_LIBRARIES' pdf2htmlEX/CMakeLists.txt
             echo '--- Unicode entry point ---'
             grep -n 'wmain\|target_link_options(pdf2htmlEX PRIVATE -municode)' pdf2htmlEX/src/pdf2htmlEX.cc pdf2htmlEX/CMakeLists.txt
+            echo '--- Absolute output path fix ---'
+            grep -n 'PDF2HTMLEX_WINDOWS_ABSOLUTE_OUTPUT_FIX' pdf2htmlEX/src/pdf2htmlEX.cc
+            echo '--- Windows UTF-8 path helpers ---'
+            grep -n 'find_last_of' pdf2htmlEX/src/util/path.cc
+            grep -n 'create_directories(native_path, ec)' pdf2htmlEX/src/util/path.cc
           } 2>&1 | tee logs/10-windows-source-patches.log
 
       - name: Prepare CSS and browser-script resources without external minifiers
@@ -896,12 +995,33 @@ jobs:
             $oneOut = Join-Path $testDir ("输出 单文件版 (" + $token + ").html")
             Write-Host "Input fixture: $pdf"
             Write-Host "Portable output: $rawOut"
-            Invoke-LoggedProcess -FilePath $rawExe -ArgumentList @($pdf, $rawOut) -WorkingDirectory $testDir -Label 'Portable executable Unicode-path conversion'
-            if (!(Test-Path -LiteralPath $rawOut) -or (Get-Item -LiteralPath $rawOut).Length -lt 100) { throw 'Portable executable did not create usable HTML at the Unicode output path' }
             Write-Host "One-file output: $oneOut"
-            Invoke-LoggedProcess -FilePath $oneExe -ArgumentList @($pdf, $oneOut) -WorkingDirectory $testDir -Label 'Single-file executable Unicode-path conversion'
-            if (!(Test-Path -LiteralPath $oneOut) -or (Get-Item -LiteralPath $oneOut).Length -lt 100) { throw 'Single-file executable did not create usable HTML at the Unicode output path' }
-            Write-Host 'All generic Unicode-path smoke tests passed.'
+            $smokeFailures = [System.Collections.Generic.List[string]]::new()
+
+            try {
+              Invoke-LoggedProcess -FilePath $rawExe -ArgumentList @($pdf, $rawOut) -WorkingDirectory $testDir -Label 'Portable executable Unicode-path conversion'
+              if (!(Test-Path -LiteralPath $rawOut) -or (Get-Item -LiteralPath $rawOut).Length -lt 100) { throw 'Portable executable did not create usable HTML at the Unicode output path' }
+              Write-Host 'PORTABLE SMOKE TEST PASSED'
+            } catch {
+              $message = "Portable executable smoke test failed: $($_.Exception.Message)"
+              Write-Host $message
+              $smokeFailures.Add($message)
+            }
+
+            try {
+              Invoke-LoggedProcess -FilePath $oneExe -ArgumentList @($pdf, $oneOut) -WorkingDirectory $testDir -Label 'Single-file executable Unicode-path conversion'
+              if (!(Test-Path -LiteralPath $oneOut) -or (Get-Item -LiteralPath $oneOut).Length -lt 100) { throw 'Single-file executable did not create usable HTML at the Unicode output path' }
+              Write-Host 'SINGLE-FILE SMOKE TEST PASSED'
+            } catch {
+              $message = "Single-file executable smoke test failed: $($_.Exception.Message)"
+              Write-Host $message
+              $smokeFailures.Add($message)
+            }
+
+            if ($smokeFailures.Count -gt 0) {
+              throw ("Unicode-path smoke tests failed: " + ($smokeFailures -join ' | '))
+            }
+            Write-Host 'All generic Unicode-path smoke tests passed for both executables.'
           } catch {
             Write-Host "SMOKE TEST FAILURE: $($_.Exception.ToString())"
             throw
